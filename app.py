@@ -6,7 +6,7 @@ from sklearn.gaussian_process import GaussianProcessClassifier
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 
 app = Flask(__name__)
-CORS(app) # Allows Vue frontend to communicate with Python backend
+CORS(app, resources={r"/api/*": {"origins": "https://christianibetsberger-bot.github.io"}}) # Allows Vue frontend to communicate with Python backend
 
 # Configuration matching your original script
 KERNEL = ConstantKernel(1.0) * RBF(length_scale=1.0)
