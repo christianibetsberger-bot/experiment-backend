@@ -68,7 +68,7 @@ def suggest_experiments():
         
         proba = clf.predict_proba(X_unknown)
         entropy = -np.sum(proba * np.log(proba + 1e-12), axis=1)
-        top_local = np.argsort(entropy)[::-1][:3]
+        top_local = np.argsort(entropy)[::-1][:96]
         selected = unknown_idx[top_local]
         
     # 5. Format and Return Suggestions
