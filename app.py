@@ -56,7 +56,8 @@ def suggest_experiments():
     # 3. Handle Edge Cases (Fallback to random if < 2 classes known)
     if known_mask.sum() < 2 or len(np.unique(y[known_mask])) < 2:
         unknown_idx = np.where(~known_mask)[0]
-        selected = np.random.choice(unknown_idx, size=min(3, len(unknown_idx)), replace=False)
+        # Changed min(3...) to min(96...) to guarantee a full plate even on cold starts
+        selected = np.random.choice(unknown_idx, size=min(96, len(unknown_idx)), replace=False)
     else:
         # 4. Run the Gaussian Process Entropy Sampling
         clf = GaussianProcessClassifier(kernel=KERNEL, n_restarts_optimizer=N_RESTARTS, random_state=RANDOM_STATE)
