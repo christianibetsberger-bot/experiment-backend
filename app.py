@@ -97,13 +97,15 @@ def suggest_experiments():
     df = pd.DataFrame(points, columns=["anion", "cation", "salt"])
     df["phase"] = -1
     
-    # 2. Integrate memory without deleting
+    # 2. Integrate memory securely (Overwrite empty grid points)
     if experiments:
         exp_df = pd.DataFrame(experiments)
         exp_df = exp_df[exp_df['phase'] != -1]
         if not exp_df.empty:
             exp_df = exp_df[["anion", "cation", "salt", "phase"]]
-            df = pd.concat([df, exp_df], ignore_index=True)
+            # Concat the knowns first, then drop duplicates to ensure grid points don't override your memory
+            df = pd.concat([exp_df, df], ignore_index=True)
+            df = df.drop_duplicates(subset=["anion", "cation", "salt"], keep="first")
             
     X_raw = df[["anion", "cation", "salt"]].values
     X = scale_features(X_raw)
@@ -134,13 +136,13 @@ def suggest_experiments():
                 else:
                     selected = midpoint_idx
         else:
-            # SAFE MODE: GP Entropy with Tie-Breaking Noise for 3D mapping
+            # SAFE MODE: GP Entropy with Tie-Breaking Noise for true 3D mapping
             clf = GaussianProcessClassifier(kernel=KERNEL, n_restarts_optimizer=N_RESTARTS, random_state=RANDOM_STATE)
             clf.fit(X[known_mask], y[known_mask])
             proba = clf.predict_proba(X[unknown_idx])
             entropy = -np.sum(proba * np.log(proba + 1e-12), axis=1)
             
-            # INJECT TIE-BREAKER NOISE to prevent 2D slicing
+            # INJECT TIE-BREAKER NOISE to prevent flat 2D slicing when uncertainty is identical
             entropy += np.random.uniform(0, 1e-8, size=entropy.shape) 
             
             top_local = np.argsort(entropy)[::-1][:n_suggestions]
