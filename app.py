@@ -167,3 +167,52 @@ def suggest_experiments():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+
+@app.route('/api/phase-boundary', methods=['POST'])
+def phase_boundary():
+    payload = request.json
+    config = payload.get('config', {})
+    experiments = payload.get('experiments', [])
+    
+    # 1. Filter knowns
+    if not experiments:
+        return jsonify({"error": "No data to build boundary."}), 400
+        
+    exp_df = pd.DataFrame(experiments)
+    exp_df = exp_df[exp_df['phase'] != -1]
+    if len(exp_df) < 2 or len(np.unique(exp_df['phase'])) < 2:
+        return jsonify({"error": "Need at least one Hit and one Clear."}), 400
+        
+    # 2. Prepare training data
+    X_known = exp_df[["anion", "cation", "salt"]].values
+    X_known_scaled = scale_features(X_known)
+    y_known = exp_df["phase"].values.astype(int)
+    
+    # 3. Train the Gaussian Process
+    clf = GaussianProcessClassifier(kernel=KERNEL, n_restarts_optimizer=N_RESTARTS, random_state=RANDOM_STATE)
+    clf.fit(X_known_scaled, y_known)
+    
+    # 4. Build a uniform visualization grid (10x10x10 = 1000 points for smooth 3D rendering)
+    anion_grid = np.linspace(0, float(config.get('anionMax', 6)), 10)
+    cation_grid = np.linspace(0, float(config.get('cationMax', 6)), 10)
+    salt_grid = np.linspace(0, float(config.get('saltMax', 200)), 10)
+    
+    mesh = np.meshgrid(anion_grid, cation_grid, salt_grid, indexing="ij")
+    grid_points = np.column_stack([m.ravel() for m in mesh])
+    
+    # Scale grid using the SAME min/max as the training data to ensure spatial alignment
+    denom = X_known.max(axis=0) - X_known.min(axis=0)
+    denom[denom == 0] = 1
+    grid_scaled = (grid_points - X_known.min(axis=0)) / denom
+    
+    # 5. Predict Probabilities
+    # predict_proba returns [P(class=0), P(class=1)]
+    proba = clf.predict_proba(grid_scaled)[:, 1] 
+    
+    # Return raw arrays optimized for Plotly
+    return jsonify({
+        "x": grid_points[:, 0].tolist(),
+        "y": grid_points[:, 1].tolist(),
+        "z": grid_points[:, 2].tolist(),
+        "prob": proba.tolist()
+    })
