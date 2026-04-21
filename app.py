@@ -77,19 +77,23 @@ def suggest_experiments():
     start_id = payload.get('start_id', 9000)
     strategy = config.get('strategy', 'safe')
     
-    # 1. Unified UI Bounds
+    # 1. Dynamically Bound Search Space (Min and Max)
+    anion_min = float(config.get('anionMin', 0))
+    cation_min = float(config.get('cationMin', 0))
+    salt_min = float(config.get('saltMin', 0))
     anion_max = float(config.get('anionMax', 6))
     cation_max = float(config.get('cationMax', 6))
     salt_max = float(config.get('saltMax', 200))
-    X_space_min = np.array([0.0, 0.0, 0.0])
+    
+    X_space_min = np.array([anion_min, cation_min, salt_min])
     X_space_max = np.array([anion_max, cation_max, salt_max])
     denom = X_space_max - X_space_min
     denom[denom == 0] = 1.0
 
-    # 2. Build Grid
-    anion_grid = np.linspace(0, anion_max, 15)
-    cation_grid = np.linspace(0, cation_max, 15)
-    salt_grid = np.linspace(0, salt_max, 10)
+    # 2. Build Grid inside the Min/Max Constraints
+    anion_grid = np.linspace(anion_min, anion_max, 15)
+    cation_grid = np.linspace(cation_min, cation_max, 15)
+    salt_grid = np.linspace(salt_min, salt_max, 10)
     mesh = np.meshgrid(anion_grid, cation_grid, salt_grid, indexing="ij")
     points = np.column_stack([m.ravel() for m in mesh])
     
@@ -105,7 +109,7 @@ def suggest_experiments():
             df = df.drop_duplicates(subset=["anion", "cation", "salt"], keep="first")
             
     X_raw = df[["anion", "cation", "salt"]].values
-    X = (X_raw - X_space_min) / denom  # Use unified scaling
+    X = (X_raw - X_space_min) / denom
     y = df["phase"].values.astype(int)
     known_mask = y != -1
     unknown_idx = np.where(~known_mask)[0]
@@ -115,9 +119,9 @@ def suggest_experiments():
         selected = unknown_idx[selected_local]
     else:
         if strategy == 'risky':
-            space_range = np.linalg.norm(X.max(axis=0) - X.min(axis=0))
+            space_range = np.linalg.norm(X_space_max - X_space_min)
             min_dist = 0.05 * space_range
-            midpoint_idx = midpoint_sampler(X, np.where(known_mask)[0], y[known_mask], min_dist)
+            midpoint_idx = midpoint_sampler(X_raw, np.where(known_mask)[0], y[known_mask], min_dist)
             midpoint_idx = np.setdiff1d(midpoint_idx, np.where(known_mask)[0])
             
             if len(midpoint_idx) >= n_suggestions:
@@ -173,11 +177,15 @@ def phase_boundary():
     X_known = exp_df[["anion", "cation", "salt"]].values
     y_known = exp_df["phase"].values.astype(int)
     
-    # Unified Scaling
+    # Unified Scaling with Min boundaries
+    anion_min = float(config.get('anionMin', 0))
+    cation_min = float(config.get('cationMin', 0))
+    salt_min = float(config.get('saltMin', 0))
     anion_max = float(config.get('anionMax', 6))
     cation_max = float(config.get('cationMax', 6))
     salt_max = float(config.get('saltMax', 200))
-    X_space_min = np.array([0.0, 0.0, 0.0])
+    
+    X_space_min = np.array([anion_min, cation_min, salt_min])
     X_space_max = np.array([anion_max, cation_max, salt_max])
     denom = X_space_max - X_space_min
     denom[denom == 0] = 1.0
@@ -187,10 +195,10 @@ def phase_boundary():
     clf = GaussianProcessClassifier(kernel=KERNEL, n_restarts_optimizer=N_RESTARTS, random_state=RANDOM_STATE)
     clf.fit(X_known_scaled, y_known)
     
-    # Smooth 3D Grid
-    anion_grid = np.linspace(0, anion_max, 15)
-    cation_grid = np.linspace(0, cation_max, 15)
-    salt_grid = np.linspace(0, salt_max, 15)
+    # Smooth 3D Grid inside the boundaries
+    anion_grid = np.linspace(anion_min, anion_max, 15)
+    cation_grid = np.linspace(cation_min, cation_max, 15)
+    salt_grid = np.linspace(salt_min, salt_max, 15)
     mesh = np.meshgrid(anion_grid, cation_grid, salt_grid, indexing="ij")
     grid_points = np.column_stack([m.ravel() for m in mesh])
     
