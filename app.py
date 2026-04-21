@@ -84,7 +84,6 @@ def suggest_experiments():
     start_id = payload.get('start_id', 9000)
     strategy = config.get('strategy', 'safe')
     
-    # 1. Build Dense Search Space (15x15x10 = 2250 points)
     param_dict = {
         "Anion": (0, float(config.get('anionMax', 6)), 15),
         "Cation": (0, float(config.get('cationMax', 6)), 15),
@@ -97,13 +96,11 @@ def suggest_experiments():
     df = pd.DataFrame(points, columns=["anion", "cation", "salt"])
     df["phase"] = -1
     
-    # 2. Integrate memory securely (Overwrite empty grid points)
     if experiments:
         exp_df = pd.DataFrame(experiments)
         exp_df = exp_df[exp_df['phase'] != -1]
         if not exp_df.empty:
             exp_df = exp_df[["anion", "cation", "salt", "phase"]]
-            # Concat the knowns first, then drop duplicates to ensure grid points don't override your memory
             df = pd.concat([exp_df, df], ignore_index=True)
             df = df.drop_duplicates(subset=["anion", "cation", "salt"], keep="first")
             
@@ -113,7 +110,6 @@ def suggest_experiments():
     known_mask = y != -1
     unknown_idx = np.where(~known_mask)[0]
     
-    # 3. Routing Engine: FPS vs Risky vs Safe
     if known_mask.sum() < 2 or len(np.unique(y[known_mask])) < 2:
         selected_local = fps_sampling(X[unknown_idx], n_suggestions)
         selected = unknown_idx[selected_local]
@@ -136,19 +132,14 @@ def suggest_experiments():
                 else:
                     selected = midpoint_idx
         else:
-            # SAFE MODE: GP Entropy with Tie-Breaking Noise for true 3D mapping
             clf = GaussianProcessClassifier(kernel=KERNEL, n_restarts_optimizer=N_RESTARTS, random_state=RANDOM_STATE)
             clf.fit(X[known_mask], y[known_mask])
             proba = clf.predict_proba(X[unknown_idx])
             entropy = -np.sum(proba * np.log(proba + 1e-12), axis=1)
-            
-            # INJECT TIE-BREAKER NOISE to prevent flat 2D slicing when uncertainty is identical
             entropy += np.random.uniform(0, 1e-8, size=entropy.shape) 
-            
             top_local = np.argsort(entropy)[::-1][:n_suggestions]
             selected = unknown_idx[top_local]
             
-    # 4. Format Output
     suggested_df = df.iloc[selected].copy()
     suggestions = []
     current_id = start_id
@@ -164,9 +155,6 @@ def suggest_experiments():
         
     return jsonify({"suggestions": suggestions})
 
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
 
 @app.route('/api/phase-boundary', methods=['POST'])
 def phase_boundary():
@@ -174,7 +162,6 @@ def phase_boundary():
     config = payload.get('config', {})
     experiments = payload.get('experiments', [])
     
-    # 1. Filter knowns
     if not experiments:
         return jsonify({"error": "No data to build boundary."}), 400
         
@@ -183,36 +170,44 @@ def phase_boundary():
     if len(exp_df) < 2 or len(np.unique(exp_df['phase'])) < 2:
         return jsonify({"error": "Need at least one Hit and one Clear."}), 400
         
-    # 2. Prepare training data
     X_known = exp_df[["anion", "cation", "salt"]].values
-    X_known_scaled = scale_features(X_known)
     y_known = exp_df["phase"].values.astype(int)
     
-    # 3. Train the Gaussian Process
+    # PERFECTED SCALING: Anchor everything to the fixed UI boundaries
+    anion_max = float(config.get('anionMax', 6))
+    cation_max = float(config.get('cationMax', 6))
+    salt_max = float(config.get('saltMax', 200))
+    
+    X_space_min = np.array([0.0, 0.0, 0.0])
+    X_space_max = np.array([anion_max, cation_max, salt_max])
+    denom = X_space_max - X_space_min
+    denom[denom == 0] = 1.0
+    
+    X_known_scaled = (X_known - X_space_min) / denom
+    
     clf = GaussianProcessClassifier(kernel=KERNEL, n_restarts_optimizer=N_RESTARTS, random_state=RANDOM_STATE)
     clf.fit(X_known_scaled, y_known)
     
-    # 4. Build a uniform visualization grid (10x10x10 = 1000 points for smooth 3D rendering)
-    anion_grid = np.linspace(0, float(config.get('anionMax', 6)), 10)
-    cation_grid = np.linspace(0, float(config.get('cationMax', 6)), 10)
-    salt_grid = np.linspace(0, float(config.get('saltMax', 200)), 10)
+    # Build a high-res visualization grid (15x15x10)
+    anion_grid = np.linspace(0, anion_max, 15)
+    cation_grid = np.linspace(0, cation_max, 15)
+    salt_grid = np.linspace(0, salt_max, 10)
     
     mesh = np.meshgrid(anion_grid, cation_grid, salt_grid, indexing="ij")
     grid_points = np.column_stack([m.ravel() for m in mesh])
     
-    # Scale grid using the SAME min/max as the training data to ensure spatial alignment
-    denom = X_known.max(axis=0) - X_known.min(axis=0)
-    denom[denom == 0] = 1
-    grid_scaled = (grid_points - X_known.min(axis=0)) / denom
+    # Scale grid identically to the known data
+    grid_scaled = (grid_points - X_space_min) / denom
     
-    # 5. Predict Probabilities
-    # predict_proba returns [P(class=0), P(class=1)]
     proba = clf.predict_proba(grid_scaled)[:, 1] 
     
-    # Return raw arrays optimized for Plotly
     return jsonify({
         "x": grid_points[:, 0].tolist(),
         "y": grid_points[:, 1].tolist(),
         "z": grid_points[:, 2].tolist(),
         "prob": proba.tolist()
     })
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
