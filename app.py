@@ -97,10 +97,10 @@ def suggest_experiments():
     df = pd.DataFrame(points, columns=["anion", "cation", "salt"])
     df["phase"] = -1
     
-    # 2. Integrate memory without deleting (Append knowns to map them out)
+    # 2. Integrate memory without deleting
     if experiments:
         exp_df = pd.DataFrame(experiments)
-        exp_df = exp_df[exp_df['phase'] != -1] # Only integrate logged results
+        exp_df = exp_df[exp_df['phase'] != -1]
         if not exp_df.empty:
             exp_df = exp_df[["anion", "cation", "salt", "phase"]]
             df = pd.concat([df, exp_df], ignore_index=True)
@@ -113,7 +113,6 @@ def suggest_experiments():
     
     # 3. Routing Engine: FPS vs Risky vs Safe
     if known_mask.sum() < 2 or len(np.unique(y[known_mask])) < 2:
-        # COLD START: Farthest Point Sampling
         selected_local = fps_sampling(X[unknown_idx], n_suggestions)
         selected = unknown_idx[selected_local]
     else:
@@ -121,12 +120,11 @@ def suggest_experiments():
             space_range = np.linalg.norm(X.max(axis=0) - X.min(axis=0))
             min_dist = 0.05 * space_range
             midpoint_idx = midpoint_sampler(X, np.where(known_mask)[0], y[known_mask], min_dist)
-            midpoint_idx = np.setdiff1d(midpoint_idx, np.where(known_mask)[0]) # Safety filter
+            midpoint_idx = np.setdiff1d(midpoint_idx, np.where(known_mask)[0])
             
             if len(midpoint_idx) >= n_suggestions:
                 selected = midpoint_idx[:n_suggestions]
             else:
-                # Pad remainder with FPS to guarantee 96 wells
                 remaining = np.setdiff1d(unknown_idx, midpoint_idx)
                 n_missing = n_suggestions - len(midpoint_idx)
                 if len(remaining) > 0:
@@ -136,11 +134,15 @@ def suggest_experiments():
                 else:
                     selected = midpoint_idx
         else:
-            # SAFE MODE: GP Entropy
+            # SAFE MODE: GP Entropy with Tie-Breaking Noise for 3D mapping
             clf = GaussianProcessClassifier(kernel=KERNEL, n_restarts_optimizer=N_RESTARTS, random_state=RANDOM_STATE)
             clf.fit(X[known_mask], y[known_mask])
             proba = clf.predict_proba(X[unknown_idx])
             entropy = -np.sum(proba * np.log(proba + 1e-12), axis=1)
+            
+            # INJECT TIE-BREAKER NOISE to prevent 2D slicing
+            entropy += np.random.uniform(0, 1e-8, size=entropy.shape) 
+            
             top_local = np.argsort(entropy)[::-1][:n_suggestions]
             selected = unknown_idx[top_local]
             
