@@ -16,13 +16,6 @@ KERNEL = ConstantKernel(1.0) * RBF(length_scale=1.0)
 N_RESTARTS = 5
 RANDOM_STATE = 42
 
-def scale_features(X):
-    X_min = X.min(axis=0)
-    X_max = X.max(axis=0)
-    denom = X_max - X_min
-    denom[denom == 0] = 1
-    return (X - X_min) / denom
-
 def fps_sampling(X, n):
     if len(X) == 0: return []
     n = min(n, len(X))
@@ -84,13 +77,20 @@ def suggest_experiments():
     start_id = payload.get('start_id', 9000)
     strategy = config.get('strategy', 'safe')
     
-    param_dict = {
-        "Anion": (0, float(config.get('anionMax', 6)), 15),
-        "Cation": (0, float(config.get('cationMax', 6)), 15),
-        "Salt": (0, float(config.get('saltMax', 200)), 10),
-    }
-    grids = [np.linspace(lo, hi, n) for col, (lo, hi, n) in param_dict.items()]
-    mesh = np.meshgrid(*grids, indexing="ij")
+    # 1. Unified UI Bounds
+    anion_max = float(config.get('anionMax', 6))
+    cation_max = float(config.get('cationMax', 6))
+    salt_max = float(config.get('saltMax', 200))
+    X_space_min = np.array([0.0, 0.0, 0.0])
+    X_space_max = np.array([anion_max, cation_max, salt_max])
+    denom = X_space_max - X_space_min
+    denom[denom == 0] = 1.0
+
+    # 2. Build Grid
+    anion_grid = np.linspace(0, anion_max, 15)
+    cation_grid = np.linspace(0, cation_max, 15)
+    salt_grid = np.linspace(0, salt_max, 10)
+    mesh = np.meshgrid(anion_grid, cation_grid, salt_grid, indexing="ij")
     points = np.column_stack([m.ravel() for m in mesh])
     
     df = pd.DataFrame(points, columns=["anion", "cation", "salt"])
@@ -105,7 +105,7 @@ def suggest_experiments():
             df = df.drop_duplicates(subset=["anion", "cation", "salt"], keep="first")
             
     X_raw = df[["anion", "cation", "salt"]].values
-    X = scale_features(X_raw)
+    X = (X_raw - X_space_min) / denom  # Use unified scaling
     y = df["phase"].values.astype(int)
     known_mask = y != -1
     unknown_idx = np.where(~known_mask)[0]
@@ -173,11 +173,10 @@ def phase_boundary():
     X_known = exp_df[["anion", "cation", "salt"]].values
     y_known = exp_df["phase"].values.astype(int)
     
-    # PERFECTED SCALING: Anchor everything to the fixed UI boundaries
+    # Unified Scaling
     anion_max = float(config.get('anionMax', 6))
     cation_max = float(config.get('cationMax', 6))
     salt_max = float(config.get('saltMax', 200))
-    
     X_space_min = np.array([0.0, 0.0, 0.0])
     X_space_max = np.array([anion_max, cation_max, salt_max])
     denom = X_space_max - X_space_min
@@ -188,18 +187,14 @@ def phase_boundary():
     clf = GaussianProcessClassifier(kernel=KERNEL, n_restarts_optimizer=N_RESTARTS, random_state=RANDOM_STATE)
     clf.fit(X_known_scaled, y_known)
     
-    # Build a highly smooth visualization grid (15x15x15 = 3375 points)
+    # Smooth 3D Grid
     anion_grid = np.linspace(0, anion_max, 15)
     cation_grid = np.linspace(0, cation_max, 15)
     salt_grid = np.linspace(0, salt_max, 15)
-    
     mesh = np.meshgrid(anion_grid, cation_grid, salt_grid, indexing="ij")
     grid_points = np.column_stack([m.ravel() for m in mesh])
     
-    # Scale grid identically to the known data
     grid_scaled = (grid_points - X_space_min) / denom
-    
-    # Securely map probability to the "Hit" class
     class_idx = list(clf.classes_).index(1) if 1 in clf.classes_ else 1
     proba = clf.predict_proba(grid_scaled)[:, class_idx] 
     
