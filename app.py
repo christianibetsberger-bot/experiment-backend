@@ -188,10 +188,10 @@ def phase_boundary():
     clf = GaussianProcessClassifier(kernel=KERNEL, n_restarts_optimizer=N_RESTARTS, random_state=RANDOM_STATE)
     clf.fit(X_known_scaled, y_known)
     
-    # Build a high-res visualization grid (15x15x10)
+    # Build a highly smooth visualization grid (15x15x15 = 3375 points)
     anion_grid = np.linspace(0, anion_max, 15)
     cation_grid = np.linspace(0, cation_max, 15)
-    salt_grid = np.linspace(0, salt_max, 10)
+    salt_grid = np.linspace(0, salt_max, 15)
     
     mesh = np.meshgrid(anion_grid, cation_grid, salt_grid, indexing="ij")
     grid_points = np.column_stack([m.ravel() for m in mesh])
@@ -199,7 +199,9 @@ def phase_boundary():
     # Scale grid identically to the known data
     grid_scaled = (grid_points - X_space_min) / denom
     
-    proba = clf.predict_proba(grid_scaled)[:, 1] 
+    # Securely map probability to the "Hit" class
+    class_idx = list(clf.classes_).index(1) if 1 in clf.classes_ else 1
+    proba = clf.predict_proba(grid_scaled)[:, class_idx] 
     
     return jsonify({
         "x": grid_points[:, 0].tolist(),
