@@ -9,11 +9,21 @@ from itertools import combinations
 import os
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "https://christianibetsberger-bot.github.io"}})
+# Relaxed CORS for seamless integration
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 KERNEL = ConstantKernel(1.0) * RBF(length_scale=1.0)
 N_RESTARTS = 5
 RANDOM_STATE = 42
+
+def safe_float(val, fallback):
+    """Machiavellian safeguard against empty UI inputs, nulls, and NaN strings."""
+    try:
+        if pd.isna(val) or val is None or str(val).strip() == '':
+            return fallback
+        return float(val)
+    except (ValueError, TypeError):
+        return fallback
 
 def fps_sampling(X, n):
     if len(X) == 0: return []
@@ -68,23 +78,23 @@ def suggest_experiments():
     payload = request.json
     config = payload.get('config', {})
     experiments = payload.get('experiments', [])
-    n_suggestions = int(payload.get('n_suggestions', config.get('numSuggestions', 96)))
-    start_id = payload.get('start_id', 9000)
+    
+    n_suggestions = int(safe_float(payload.get('n_suggestions', config.get('numSuggestions', 96)), 96))
+    start_id = int(safe_float(payload.get('start_id', 9000), 9000))
     strategy = config.get('strategy', 'safe')
-    min_dist_factor = float(config.get('minDistanceFactor', 0.05))
+    min_dist_factor = safe_float(config.get('minDistanceFactor'), 0.05)
     
-    # Grid Boundaries
-    anion_min = float(config.get('anionMin', 0))
-    cation_min = float(config.get('cationMin', 0))
-    salt_min = float(config.get('saltMin', 0))
-    anion_max = float(config.get('anionMax', 6))
-    cation_max = float(config.get('cationMax', 6))
-    salt_max = float(config.get('saltMax', 200))
+    # Safely extract boundaries, falling back to logical defaults if the UI input was cleared
+    anion_min = safe_float(config.get('anionMin'), 0.0)
+    cation_min = safe_float(config.get('cationMin'), 0.0)
+    salt_min = safe_float(config.get('saltMin'), 0.0)
+    anion_max = safe_float(config.get('anionMax'), 6.0)
+    cation_max = safe_float(config.get('cationMax'), 6.0)
+    salt_max = safe_float(config.get('saltMax'), 200.0)
     
-    # Step Enforcement (With mathematical failsafes to prevent memory crash)
-    anion_step = max(float(config.get('anionStep', 0.5)), (anion_max - anion_min)/100.0)
-    cation_step = max(float(config.get('cationStep', 0.5)), (cation_max - cation_min)/100.0)
-    salt_step = max(float(config.get('saltStep', 10.0)), (salt_max - salt_min)/100.0)
+    anion_step = max(safe_float(config.get('anionStep'), 0.5), (anion_max - anion_min)/100.0)
+    cation_step = max(safe_float(config.get('cationStep'), 0.5), (cation_max - cation_min)/100.0)
+    salt_step = max(safe_float(config.get('saltStep'), 10.0), (salt_max - salt_min)/100.0)
     
     X_space_min = np.array([anion_min, cation_min, salt_min])
     X_space_max = np.array([anion_max, cation_max, salt_max])
@@ -94,7 +104,6 @@ def suggest_experiments():
     space_range = np.linalg.norm(X_space_max - X_space_min)
     min_dist = min_dist_factor * space_range
 
-    # Build Step-Locked Grid
     anion_grid = np.arange(anion_min, anion_max + (anion_step*0.1), anion_step)
     cation_grid = np.arange(cation_min, cation_max + (cation_step*0.1), cation_step)
     salt_grid = np.arange(salt_min, salt_max + (salt_step*0.1), salt_step)
@@ -106,9 +115,12 @@ def suggest_experiments():
     
     if experiments:
         exp_df = pd.DataFrame(experiments)
+        # RUTHLESS SANITIZATION: Force numeric types and drop any row with NaN coordinates
+        exp_df = exp_df[["anion", "cation", "salt", "phase"]].apply(pd.to_numeric, errors='coerce')
+        exp_df = exp_df.dropna()
         exp_df = exp_df[exp_df['phase'] != -1]
+        
         if not exp_df.empty:
-            exp_df = exp_df[["anion", "cation", "salt", "phase"]]
             df = pd.concat([exp_df, df], ignore_index=True)
             df = df.drop_duplicates(subset=["anion", "cation", "salt"], keep="first")
             
@@ -118,7 +130,6 @@ def suggest_experiments():
     known_mask = y != -1
     unknown_idx = np.where(~known_mask)[0]
     
-    # Multi-class compatibility check
     if known_mask.sum() < 2 or len(np.unique(y[known_mask])) < 2:
         selected_local = fps_sampling(X[unknown_idx], n_suggestions)
         selected = unknown_idx[selected_local]
@@ -137,12 +148,10 @@ def suggest_experiments():
                 else:
                     selected = midpoint_idx
         else:
-            # GP natively supports multi-class One-vs-Rest!
             clf = GaussianProcessClassifier(kernel=KERNEL, n_restarts_optimizer=N_RESTARTS, random_state=RANDOM_STATE)
             clf.fit(X[known_mask], y[known_mask])
             proba = clf.predict_proba(X[unknown_idx])
             
-            # Shannon Entropy captures uncertainty across ALL 5 possible phases
             entropy = -np.sum(proba * np.log(proba + 1e-12), axis=1)
             entropy += np.random.uniform(0, 1e-8, size=entropy.shape) 
             
@@ -193,16 +202,29 @@ def phase_boundary():
     experiments = payload.get('experiments', [])
     
     if not experiments: return jsonify({"error": "No data."}), 400
+    
     exp_df = pd.DataFrame(experiments)
+    
+    # RUTHLESS SANITIZATION: Protect the fitting model from empty data
+    exp_df = exp_df[["anion", "cation", "salt", "phase"]].apply(pd.to_numeric, errors='coerce')
+    exp_df = exp_df.dropna()
     exp_df = exp_df[exp_df['phase'] != -1]
-    if len(exp_df) < 2 or len(np.unique(exp_df['phase'])) < 2: return jsonify({"error": "Need multiple phases."}), 400
+    
+    if len(exp_df) < 2 or len(np.unique(exp_df['phase'])) < 2: 
+        return jsonify({"error": "Need multiple phases."}), 400
         
     X_known = exp_df[["anion", "cation", "salt"]].values
     y_known = exp_df["phase"].values.astype(int)
     
-    anion_min, cation_min, salt_min = float(config.get('anionMin', 0)), float(config.get('cationMin', 0)), float(config.get('saltMin', 0))
-    anion_max, cation_max, salt_max = float(config.get('anionMax', 6)), float(config.get('cationMax', 6)), float(config.get('saltMax', 200))
-    X_space_min, X_space_max = np.array([anion_min, cation_min, salt_min]), np.array([anion_max, cation_max, salt_max])
+    anion_min = safe_float(config.get('anionMin'), 0.0)
+    cation_min = safe_float(config.get('cationMin'), 0.0)
+    salt_min = safe_float(config.get('saltMin'), 0.0)
+    anion_max = safe_float(config.get('anionMax'), 6.0)
+    cation_max = safe_float(config.get('cationMax'), 6.0)
+    salt_max = safe_float(config.get('saltMax'), 200.0)
+    
+    X_space_min = np.array([anion_min, cation_min, salt_min])
+    X_space_max = np.array([anion_max, cation_max, salt_max])
     denom = X_space_max - X_space_min
     denom[denom == 0] = 1.0
     
@@ -210,7 +232,6 @@ def phase_boundary():
     clf = GaussianProcessClassifier(kernel=KERNEL, n_restarts_optimizer=N_RESTARTS, random_state=RANDOM_STATE)
     clf.fit(X_known_scaled, y_known)
     
-    # Smooth 3D Grid for visual bounds
     anion_grid = np.linspace(anion_min, anion_max, 15)
     cation_grid = np.linspace(cation_min, cation_max, 15)
     salt_grid = np.linspace(salt_min, salt_max, 15)
@@ -219,11 +240,9 @@ def phase_boundary():
     
     grid_scaled = (grid_points - X_space_min) / denom
     
-    # MULTI-CLASS SHANNON ENTROPY: Defines the boundary regardless of how many phases exist
     proba = clf.predict_proba(grid_scaled)
     entropy = -np.sum(proba * np.log(proba + 1e-12), axis=1)
     
-    # Normalize entropy so 1.0 is always the absolute boundary peak (highest uncertainty)
     e_min, e_max = np.min(entropy), np.max(entropy)
     norm_entropy = (entropy - e_min) / (e_max - e_min) if e_max > e_min else entropy
     
