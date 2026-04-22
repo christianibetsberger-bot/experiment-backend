@@ -9,7 +9,6 @@ from itertools import combinations
 import os
 
 app = Flask(__name__)
-# Relaxed CORS for seamless integration
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 KERNEL = ConstantKernel(1.0) * RBF(length_scale=1.0)
@@ -17,7 +16,6 @@ N_RESTARTS = 5
 RANDOM_STATE = 42
 
 def safe_float(val, fallback):
-    """Machiavellian safeguard against empty UI inputs, nulls, and NaN strings."""
     try:
         if pd.isna(val) or val is None or str(val).strip() == '':
             return fallback
@@ -84,17 +82,15 @@ def suggest_experiments():
     strategy = config.get('strategy', 'safe')
     min_dist_factor = safe_float(config.get('minDistanceFactor'), 0.05)
     
-    # Safely extract boundaries, falling back to logical defaults if the UI input was cleared
-    anion_min = safe_float(config.get('anionMin'), 0.0)
-    cation_min = safe_float(config.get('cationMin'), 0.0)
-    salt_min = safe_float(config.get('saltMin'), 0.0)
-    anion_max = safe_float(config.get('anionMax'), 6.0)
-    cation_max = safe_float(config.get('cationMax'), 6.0)
-    salt_max = safe_float(config.get('saltMax'), 200.0)
+    anion_min, cation_min, salt_min = safe_float(config.get('anionMin'), 0.0), safe_float(config.get('cationMin'), 0.0), safe_float(config.get('saltMin'), 0.0)
+    anion_max, cation_max, salt_max = safe_float(config.get('anionMax'), 6.0), safe_float(config.get('cationMax'), 6.0), safe_float(config.get('saltMax'), 200.0)
     
-    anion_step = max(safe_float(config.get('anionStep'), 0.5), (anion_max - anion_min)/100.0)
-    cation_step = max(safe_float(config.get('cationStep'), 0.5), (cation_max - cation_min)/100.0)
-    salt_step = max(safe_float(config.get('saltStep'), 10.0), (salt_max - salt_min)/100.0)
+    anion_step = max(safe_float(config.get('anionStep'), 0.5), (anion_max - anion_min)/40.0)
+    cation_step = max(safe_float(config.get('cationStep'), 0.5), (cation_max - cation_min)/40.0)
+    salt_step = max(safe_float(config.get('saltStep'), 10.0), (salt_max - salt_min)/40.0)
+    if anion_step <= 0: anion_step = 1.0
+    if cation_step <= 0: cation_step = 1.0
+    if salt_step <= 0: salt_step = 1.0
     
     X_space_min = np.array([anion_min, cation_min, salt_min])
     X_space_max = np.array([anion_max, cation_max, salt_max])
@@ -115,9 +111,7 @@ def suggest_experiments():
     
     if experiments:
         exp_df = pd.DataFrame(experiments)
-        # RUTHLESS SANITIZATION: Force numeric types and drop any row with NaN coordinates
-        exp_df = exp_df[["anion", "cation", "salt", "phase"]].apply(pd.to_numeric, errors='coerce')
-        exp_df = exp_df.dropna()
+        exp_df = exp_df[["anion", "cation", "salt", "phase"]].apply(pd.to_numeric, errors='coerce').dropna()
         exp_df = exp_df[exp_df['phase'] != -1]
         
         if not exp_df.empty:
@@ -150,9 +144,12 @@ def suggest_experiments():
         else:
             clf = GaussianProcessClassifier(kernel=KERNEL, n_restarts_optimizer=N_RESTARTS, random_state=RANDOM_STATE)
             clf.fit(X[known_mask], y[known_mask])
+            
             proba = clf.predict_proba(X[unknown_idx])
+            proba = np.nan_to_num(proba, nan=1e-6)
             
             entropy = -np.sum(proba * np.log(proba + 1e-12), axis=1)
+            entropy = np.nan_to_num(entropy, nan=0.0)
             entropy += np.random.uniform(0, 1e-8, size=entropy.shape) 
             
             sorted_indices = np.argsort(entropy)[::-1]
@@ -195,6 +192,7 @@ def suggest_experiments():
         
     return jsonify({"suggestions": suggestions})
 
+
 @app.route('/api/phase-boundary', methods=['POST'])
 def phase_boundary():
     payload = request.json
@@ -204,11 +202,9 @@ def phase_boundary():
     if not experiments: return jsonify({"error": "No data."}), 400
     
     exp_df = pd.DataFrame(experiments)
-    
-    # RUTHLESS SANITIZATION: Protect the fitting model from empty data
-    exp_df = exp_df[["anion", "cation", "salt", "phase"]].apply(pd.to_numeric, errors='coerce')
-    exp_df = exp_df.dropna()
+    exp_df = exp_df[["anion", "cation", "salt", "phase"]].apply(pd.to_numeric, errors='coerce').dropna()
     exp_df = exp_df[exp_df['phase'] != -1]
+    exp_df = exp_df.drop_duplicates(subset=["anion", "cation", "salt"], keep="first")
     
     if len(exp_df) < 2 or len(np.unique(exp_df['phase'])) < 2: 
         return jsonify({"error": "Need multiple phases."}), 400
@@ -216,12 +212,8 @@ def phase_boundary():
     X_known = exp_df[["anion", "cation", "salt"]].values
     y_known = exp_df["phase"].values.astype(int)
     
-    anion_min = safe_float(config.get('anionMin'), 0.0)
-    cation_min = safe_float(config.get('cationMin'), 0.0)
-    salt_min = safe_float(config.get('saltMin'), 0.0)
-    anion_max = safe_float(config.get('anionMax'), 6.0)
-    cation_max = safe_float(config.get('cationMax'), 6.0)
-    salt_max = safe_float(config.get('saltMax'), 200.0)
+    anion_min, cation_min, salt_min = safe_float(config.get('anionMin'), 0.0), safe_float(config.get('cationMin'), 0.0), safe_float(config.get('saltMin'), 0.0)
+    anion_max, cation_max, salt_max = safe_float(config.get('anionMax'), 6.0), safe_float(config.get('cationMax'), 6.0), safe_float(config.get('saltMax'), 200.0)
     
     X_space_min = np.array([anion_min, cation_min, salt_min])
     X_space_max = np.array([anion_max, cation_max, salt_max])
@@ -237,20 +229,21 @@ def phase_boundary():
     salt_grid = np.linspace(salt_min, salt_max, 15)
     mesh = np.meshgrid(anion_grid, cation_grid, salt_grid, indexing="ij")
     grid_points = np.column_stack([m.ravel() for m in mesh])
-    
     grid_scaled = (grid_points - X_space_min) / denom
     
+    # Extract independent probability fields for EVERY identified class
     proba = clf.predict_proba(grid_scaled)
-    entropy = -np.sum(proba * np.log(proba + 1e-12), axis=1)
+    prob_dict = {}
     
-    e_min, e_max = np.min(entropy), np.max(entropy)
-    norm_entropy = (entropy - e_min) / (e_max - e_min) if e_max > e_min else entropy
+    for i, class_label in enumerate(clf.classes_):
+        clean_proba = np.nan_to_num(proba[:, i], nan=1e-6)
+        prob_dict[str(class_label)] = clean_proba.tolist()
     
     return jsonify({
         "x": grid_points[:, 0].tolist(),
         "y": grid_points[:, 1].tolist(),
         "z": grid_points[:, 2].tolist(),
-        "prob": norm_entropy.tolist() 
+        "probs": prob_dict 
     })
 
 if __name__ == '__main__':
