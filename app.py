@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from scipy.spatial import distance_matrix
+from scipy.ndimage import gaussian_filter
 from itertools import combinations
 import os
 
@@ -195,13 +196,18 @@ def phase_boundary():
 
     if not experiments: return jsonify({"error": "No data."}), 400
 
+    n_received = len(experiments)
     exp_df = pd.DataFrame(experiments)
     exp_df = exp_df[["anion", "cation", "salt", "phase"]].apply(pd.to_numeric, errors='coerce').dropna()
+    # Keep only labeled rows; prefer the last entry for duplicate coordinates (covers phase updates)
     exp_df = exp_df[exp_df['phase'] != -1]
-    exp_df = exp_df.drop_duplicates(subset=["anion", "cation", "salt"], keep="first")
+    exp_df = exp_df.drop_duplicates(subset=["anion", "cation", "salt"], keep="last")
 
-    if len(exp_df) < 2 or len(np.unique(exp_df['phase'])) < 2:
-        return jsonify({"error": "Need multiple phases."}), 400
+    n_labeled = len(exp_df)
+    print(f"[phase-boundary] received={n_received}  labeled={n_labeled}  phases={sorted(exp_df['phase'].unique().tolist())}")
+
+    if n_labeled < 2 or len(np.unique(exp_df['phase'])) < 2:
+        return jsonify({"error": f"Need at least 2 labeled points from 2 different phases (got {n_labeled} labeled)."}), 400
 
     X_known = exp_df[["anion", "cation", "salt"]].values
     y_known = exp_df["phase"].values.astype(int)
@@ -219,25 +225,35 @@ def phase_boundary():
     clf = RandomForestClassifier(n_estimators=300, random_state=RANDOM_STATE)
     clf.fit(X_known_scaled, y_known)
 
-    # Render grid (20x20x20 for smoother surfaces)
-    anion_grid = np.linspace(anion_min, anion_max, 20)
-    cation_grid = np.linspace(cation_min, cation_max, 20)
-    salt_grid = np.linspace(salt_min, salt_max, 20)
+    # 20^3 grid for the probability field
+    N = 20
+    anion_grid = np.linspace(anion_min, anion_max, N)
+    cation_grid = np.linspace(cation_min, cation_max, N)
+    salt_grid = np.linspace(salt_min, salt_max, N)
     mesh = np.meshgrid(anion_grid, cation_grid, salt_grid, indexing="ij")
     grid_points = np.column_stack([m.ravel() for m in mesh])
     grid_scaled = (grid_points - X_space_min) / denom
 
-    proba = clf.predict_proba(grid_scaled)
+    predicted_class = clf.predict(grid_scaled)
     prob_dict = {}
 
-    for i, class_label in enumerate(clf.classes_):
-        prob_dict[str(class_label)] = proba[:, i].tolist()
+    for class_label in clf.classes_:
+        # Build a 0/1 indicator: 1 where RFC votes for this class, 0 elsewhere.
+        # RFC memorises its training data, so all training points are in regions
+        # where this field == 1 before smoothing → they stay inside the isosurface.
+        # Light Gaussian smoothing (sigma=1.0) just anti-aliases the jagged voxel edges.
+        field = (predicted_class == class_label).astype(float).reshape(N, N, N)
+        smoothed = gaussian_filter(field, sigma=1.0)
+        prob_dict[str(class_label)] = smoothed.ravel().tolist()
 
     return jsonify({
         "x": grid_points[:, 0].tolist(),
         "y": grid_points[:, 1].tolist(),
         "z": grid_points[:, 2].tolist(),
-        "probs": prob_dict
+        "probs": prob_dict,
+        "n_received": n_received,
+        "n_labeled": n_labeled,
+        "phases_used": sorted([int(c) for c in clf.classes_])
     })
 
 if __name__ == '__main__':
