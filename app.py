@@ -78,12 +78,18 @@ def suggest_experiments():
     anion_min, cation_min, salt_min = safe_float(config.get('anionMin'), 0.0), safe_float(config.get('cationMin'), 0.0), safe_float(config.get('saltMin'), 0.0)
     anion_max, cation_max, salt_max = safe_float(config.get('anionMax'), 6.0), safe_float(config.get('cationMax'), 6.0), safe_float(config.get('saltMax'), 200.0)
 
-    anion_step = max(safe_float(config.get('anionStep'), 0.5), (anion_max - anion_min)/40.0)
-    cation_step = max(safe_float(config.get('cationStep'), 0.5), (cation_max - cation_min)/40.0)
-    salt_step = max(safe_float(config.get('saltStep'), 10.0), (salt_max - salt_min)/40.0)
-    if anion_step <= 0: anion_step = 1.0
-    if cation_step <= 0: cation_step = 1.0
-    if salt_step <= 0: salt_step = 1.0
+    anion_step  = safe_float(config.get('anionStep'),  0.5)
+    cation_step = safe_float(config.get('cationStep'), 0.5)
+    salt_step   = safe_float(config.get('saltStep'),  10.0)
+    if anion_step  <= 0: anion_step  = (anion_max  - anion_min)  / 20.0 or 1.0
+    if cation_step <= 0: cation_step = (cation_max - cation_min) / 20.0 or 1.0
+    if salt_step   <= 0: salt_step   = (salt_max   - salt_min)   / 20.0 or 1.0
+    # Cap each axis at 100 steps to prevent accidental memory blowout; user step
+    # is honoured as long as it produces ≤100 grid points per axis.
+    MAX_PER_AXIS = 100
+    anion_step  = max(anion_step,  (anion_max  - anion_min)  / MAX_PER_AXIS)
+    cation_step = max(cation_step, (cation_max - cation_min) / MAX_PER_AXIS)
+    salt_step   = max(salt_step,   (salt_max   - salt_min)   / MAX_PER_AXIS)
 
     X_space_min = np.array([anion_min, cation_min, salt_min])
     X_space_max = np.array([anion_max, cation_max, salt_max])
