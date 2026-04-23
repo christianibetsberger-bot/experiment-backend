@@ -2,8 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
 import pandas as pd
-from sklearn.gaussian_process import GaussianProcessClassifier
-from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
+from sklearn.ensemble import RandomForestClassifier
 from scipy.spatial import distance_matrix
 from itertools import combinations
 import os
@@ -11,9 +10,6 @@ import os
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# THE SHOCK ABSORBER: WhiteKernel prevents matrix singularity in multi-class One-vs-Rest models
-KERNEL = ConstantKernel(1.0, (1e-3, 1e3)) * RBF(length_scale=1.0, length_scale_bounds=(1e-2, 1e2)) + WhiteKernel(noise_level=1e-3, noise_level_bounds=(1e-5, 1e-1))
-N_RESTARTS = 5
 RANDOM_STATE = 42
 
 def safe_float(val, fallback):
@@ -138,7 +134,7 @@ def suggest_experiments():
                     selected = midpoint_idx
         else:
             try:
-                clf = GaussianProcessClassifier(kernel=KERNEL, n_restarts_optimizer=N_RESTARTS, random_state=RANDOM_STATE)
+                clf = RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE)
                 clf.fit(X[known_mask], y[known_mask])
                 proba = clf.predict_proba(X[unknown_idx])
                 proba = np.nan_to_num(proba, nan=1e-6)
@@ -220,16 +216,13 @@ def phase_boundary():
 
     X_known_scaled = (X_known - X_space_min) / denom
 
-    try:
-        clf = GaussianProcessClassifier(kernel=KERNEL, n_restarts_optimizer=N_RESTARTS, random_state=RANDOM_STATE)
-        clf.fit(X_known_scaled, y_known)
-    except Exception as e:
-        return jsonify({"error": f"Convergence Failed: {str(e)}"}), 500
+    clf = RandomForestClassifier(n_estimators=300, random_state=RANDOM_STATE)
+    clf.fit(X_known_scaled, y_known)
 
-    # Render grid (15x15x15)
-    anion_grid = np.linspace(anion_min, anion_max, 15)
-    cation_grid = np.linspace(cation_min, cation_max, 15)
-    salt_grid = np.linspace(salt_min, salt_max, 15)
+    # Render grid (20x20x20 for smoother surfaces)
+    anion_grid = np.linspace(anion_min, anion_max, 20)
+    cation_grid = np.linspace(cation_min, cation_max, 20)
+    salt_grid = np.linspace(salt_min, salt_max, 20)
     mesh = np.meshgrid(anion_grid, cation_grid, salt_grid, indexing="ij")
     grid_points = np.column_stack([m.ravel() for m in mesh])
     grid_scaled = (grid_points - X_space_min) / denom
@@ -238,9 +231,7 @@ def phase_boundary():
     prob_dict = {}
 
     for i, class_label in enumerate(clf.classes_):
-        # Neutralize any NaNs from degenerate multi-class subsets to 0.0
-        clean_proba = np.nan_to_num(proba[:, i], nan=0.0)
-        prob_dict[str(class_label)] = clean_proba.tolist()
+        prob_dict[str(class_label)] = proba[:, i].tolist()
 
     return jsonify({
         "x": grid_points[:, 0].tolist(),
