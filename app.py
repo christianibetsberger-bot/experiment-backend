@@ -6,7 +6,7 @@ from sklearn.gaussian_process import GaussianProcessClassifier
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
 from scipy.spatial import distance_matrix
 from itertools import combinations
-import os
+import os 
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
