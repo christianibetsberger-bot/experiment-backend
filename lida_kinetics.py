@@ -293,35 +293,41 @@ def kinetics_suggest():
 
     X = np.array([_featurize(e, max_len, env_vocab) for e in exps])
     y = np.array([_max_yield(e) for e in exps])
-    rf = RandomForestRegressor(n_estimators=200, random_state=0).fit(X, y)
+    rf = RandomForestRegressor(n_estimators=100, random_state=0, n_jobs=1).fit(X, y)
 
     rng = np.random.default_rng(42)
-    candidates = []
-    n_trials = max(500, n * 50)
+    n_trials = max(200, n * 30)
+
+    # Generate all candidate experiments first, then score them in one batch.
+    cand_exps = []
     for _ in range(n_trials):
-        seq = ''.join(rng.choice(BASES, size=max_len))
-        cand_exp = {
-            'sequence': seq,
+        cand_exps.append({
+            'sequence': ''.join(rng.choice(BASES, size=max_len)),
             'conditions': {
-                'temperature': float(rng.uniform(ranges.get('tMin', 20), ranges.get('tMax', 50))),
+                'temperature': float(rng.uniform(ranges.get('tMin', 20),    ranges.get('tMax', 50))),
                 'ligase':      float(rng.uniform(ranges.get('ligaseMin', 0), ranges.get('ligaseMax', 10))),
-                'atp':         float(rng.uniform(ranges.get('atpMin', 0), ranges.get('atpMax', 10))),
-                'mg2':         float(rng.uniform(ranges.get('mg2Min', 0), ranges.get('mg2Max', 20))),
+                'atp':         float(rng.uniform(ranges.get('atpMin', 0),   ranges.get('atpMax', 10))),
+                'mg2':         float(rng.uniform(ranges.get('mg2Min', 0),   ranges.get('mg2Max', 20))),
                 'env':         str(rng.choice(env_vocab)),
             },
-        }
-        x = _featurize(cand_exp, max_len, env_vocab).reshape(1, -1)
-        per_tree = np.array([t.predict(x)[0] for t in rf.estimators_])
-        candidates.append({
-            **cand_exp,
-            'predicted_conversion': float(per_tree.mean()),
-            'uncertainty': float(per_tree.std()),
         })
 
-    if strategy == 'explore':
-        candidates.sort(key=lambda c: -c['uncertainty'])
-    else:
-        candidates.sort(key=lambda c: -c['predicted_conversion'])
+    Xc = np.asarray([_featurize(c, max_len, env_vocab) for c in cand_exps])
+    # Vectorised: per-tree predictions for ALL candidates in a single sweep.
+    # Shape: (n_estimators, n_trials). ~200x faster than per-row predict on Render.
+    per_tree = np.asarray([tree.predict(Xc) for tree in rf.estimators_])
+    means = per_tree.mean(axis=0)
+    stds  = per_tree.std(axis=0)
+
+    candidates = [
+        {**cand_exps[i],
+         'predicted_conversion': float(means[i]),
+         'uncertainty':         float(stds[i])}
+        for i in range(len(cand_exps))
+    ]
+
+    key = (lambda c: -c['uncertainty']) if strategy == 'explore' else (lambda c: -c['predicted_conversion'])
+    candidates.sort(key=key)
     return jsonify({'suggestions': candidates[:n]})
 
 
@@ -339,7 +345,7 @@ def kinetics_sequence_predict():
 
     X = np.array([_featurize(e, max_len, env_vocab) for e in exps])
     y = np.array([_max_yield(e) for e in exps])
-    rf = RandomForestRegressor(n_estimators=200, random_state=0).fit(X, y)
+    rf = RandomForestRegressor(n_estimators=100, random_state=0, n_jobs=1).fit(X, y)
 
     best_exp = max(exps, key=_max_yield)
     cond = fixed or best_exp['conditions']
@@ -347,41 +353,44 @@ def kinetics_sequence_predict():
     if len(seq) < max_len:
         seq += ['A'] * (max_len - len(seq))
 
+    def score_position_variants(seq_list, pos):
+        """Return rf-predicted yield for [seq with base=A,C,G,T at `pos`] in one batched predict."""
+        feats = []
+        for b in BASES:
+            tmp = seq_list.copy()
+            tmp[pos] = b
+            feats.append(_featurize({'sequence': ''.join(tmp), 'conditions': cond}, max_len, env_vocab))
+        return rf.predict(np.asarray(feats))  # shape (4,)
+
     rng = np.random.default_rng()
     candidates = []
+    MAX_PASSES = 3   # bound greedy hill-climb time on Render's shared CPU
     for _ in range(topK):
-        improved = True
-        while improved:
+        improved, passes = True, 0
+        while improved and passes < MAX_PASSES:
             improved = False
+            passes += 1
             for i in range(max_len):
-                best_b, best_yhat = seq[i], -np.inf
-                for b in BASES:
-                    seq[i] = b
-                    x = _featurize({'sequence': ''.join(seq), 'conditions': cond}, max_len, env_vocab).reshape(1, -1)
-                    yhat = float(rf.predict(x)[0])
-                    if yhat > best_yhat:
-                        best_b, best_yhat = b, yhat
-                if seq[i] != best_b:
-                    seq[i] = best_b
+                preds = score_position_variants(seq, i)
+                best_idx = int(np.argmax(preds))
+                if seq[i] != BASES[best_idx]:
+                    seq[i] = BASES[best_idx]
                     improved = True
 
+        # Per-position score grid for the optimum (one batched predict per position).
         per_pos = []
         for i in range(max_len):
-            scores = {}
-            for b in BASES:
-                tmp = seq.copy()
-                tmp[i] = b
-                x = _featurize({'sequence': ''.join(tmp), 'conditions': cond}, max_len, env_vocab).reshape(1, -1)
-                scores[b] = float(rf.predict(x)[0])
-            per_pos.append(scores)
+            preds = score_position_variants(seq, i)
+            per_pos.append({BASES[k]: float(preds[k]) for k in range(4)})
 
-        x = _featurize({'sequence': ''.join(seq), 'conditions': cond}, max_len, env_vocab).reshape(1, -1)
+        feat = _featurize({'sequence': ''.join(seq), 'conditions': cond}, max_len, env_vocab).reshape(1, -1)
         candidates.append({
             'sequence': ''.join(seq),
-            'predicted_conversion': float(rf.predict(x)[0]),
+            'predicted_conversion': float(rf.predict(feat)[0]),
             'perPositionScore': per_pos,
         })
 
+        # Perturb one position to seed the next candidate.
         idx = int(rng.integers(0, max_len))
         seq[idx] = str(rng.choice([b for b in BASES if b != seq[idx]]))
 
