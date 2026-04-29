@@ -62,13 +62,32 @@ def _replication_ode(t, y, ku, k1, k2, kr):
     return [dA, da, dB, db, dAa, dBb, dR]
 
 
-def _simulate_R(params, initial_R, times, A0, B0):
-    """Integrate the replication ODE; return [R](t) interpolated at `times`."""
+def _simulate_R_at(params, initial_R, t_eval, A0, B0, rtol=1e-4, atol=1e-7):
+    """Integrate the replication ODE and return [R] at the supplied time points only.
+    Used in the fitting hot loop — looser tolerances + no extra grid points."""
     ku, k1, k2, kr = params
     y0 = [A0, A0, B0, B0, 0.0, 0.0, float(initial_R)]
-    t_max = float(np.max(times)) + 5.0
+    t_max = float(t_eval[-1]) + 1e-6
     try:
-        t_grid = np.linspace(0.0, t_max, 120)
+        sol = solve_ivp(
+            _replication_ode, (0.0, t_max), y0,
+            args=(ku, k1, k2, kr),
+            t_eval=t_eval, method='LSODA',
+            rtol=rtol, atol=atol,
+        )
+        if not sol.success:
+            return None
+        return sol.y[6]
+    except Exception:
+        return None
+
+
+def _simulate_R_dense(params, initial_R, t_max, A0, B0, n=100):
+    """Fine-grid simulation used once per group for the frontend overlay."""
+    ku, k1, k2, kr = params
+    y0 = [A0, A0, B0, B0, 0.0, 0.0, float(initial_R)]
+    t_grid = np.linspace(0.0, t_max, n)
+    try:
         sol = solve_ivp(
             _replication_ode, (0.0, t_max), y0,
             args=(ku, k1, k2, kr),
@@ -76,19 +95,17 @@ def _simulate_R(params, initial_R, times, A0, B0):
             rtol=1e-6, atol=1e-9,
         )
         if not sol.success:
-            return None, None, None
-        R_vals = sol.y[6]
-        R_at_t = np.interp(np.asarray(times, dtype=float), sol.t, R_vals)
-        return R_at_t, sol.t, R_vals
+            return None, None
+        return sol.t, sol.y[6]
     except Exception:
-        return None, None, None
+        return None, None
 
 
 def _residuals(params, t_data, y_data, initial_R, A0, B0):
     """Concentration-domain residuals; large penalty for negative-slope simulations."""
     if np.any(np.array(params) < 0):
         return np.full_like(y_data, 1e6)
-    y_sim, _, _ = _simulate_R(params, initial_R, t_data, A0, B0)
+    y_sim = _simulate_R_at(params, initial_R, t_data, A0, B0)
     if y_sim is None or np.any(np.isnan(y_sim)):
         return np.full_like(y_data, 1e6)
     diffs = np.diff(y_sim)
@@ -97,19 +114,15 @@ def _residuals(params, t_data, y_data, initial_R, A0, B0):
 
 
 def _build_initial_guesses():
-    """Mirror the notebook's multi-start pool (4 hand-picked + 6 random log-uniform)."""
-    rng = np.random.default_rng(42)
-    guesses = [
+    """Compact multi-start pool. The notebook uses 14 starts on a fast local CPU;
+    Render's shared CPU is ~10x slower so we keep 4 hand-picked seeds covering
+    the same orders-of-magnitude slow/fast/intermediate regimes."""
+    return [
         [1e-6, 1e-3, 1e-11, 1e-6],
         [1e-3, 1e-1, 1e-11, 1e-1],
         [1e-2, 1.0,  1e-11, 1.0 ],
         [1e-5, 1.0,  1e-11, 10.0],
     ]
-    for _ in range(6):
-        g = np.power(10.0, rng.uniform(-4.0, 1.5, size=4)).tolist()
-        g[2] = 1e-11
-        guesses.append(g)
-    return guesses
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -206,17 +219,23 @@ def kinetics_fit():
         initial_R = float(seed_pct * np.mean(y_data))
 
         best_res, best_cost = None, np.inf
+        # Cost is sum-of-squares of residuals (in uM^2). For data spanning 0..limit_uM
+        # a residual of 1% of limit is ~1e-4 per point — a cost below that level is
+        # effectively a converged fit, so we can skip remaining starts.
+        good_enough = max(1e-4, 1e-4 * (limit_uM ** 2) * len(t_data))
         for p0 in guesses:
             try:
                 res = least_squares(
                     _residuals, p0,
                     args=(t_data, y_data, initial_R, A0, B0),
                     bounds=([0.0, 0.0, 0.0, 0.0], [100.0, 100.0, 1e-10, 100.0]),
-                    ftol=1e-8, xtol=1e-8, max_nfev=200,
+                    ftol=1e-6, xtol=1e-6, max_nfev=80,
                 )
                 if res.success and res.cost < best_cost:
                     best_cost = res.cost
                     best_res = res
+                    if best_cost < good_enough:
+                        break
             except Exception:
                 continue
 
@@ -229,7 +248,7 @@ def kinetics_fit():
 
         ku, k1, k2, kr = best_res.x
         # High-resolution simulated curve for frontend overlay (returned in % units).
-        _, sim_t, sim_R = _simulate_R(best_res.x, initial_R, t_data, A0, B0)
+        sim_t, sim_R = _simulate_R_dense(best_res.x, initial_R, float(t_data[-1]) + 5.0, A0, B0)
         sim_y_pct = (sim_R / limit_uM) * 100.0 if sim_R is not None else None
 
         fits.append({
