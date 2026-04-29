@@ -1,41 +1,122 @@
 """
 LIDA Kinetics endpoints — Lesion-Induced DNA Amplification.
 
-Drop this file into the experiment-backend repo (alongside app.py) and
-register the Blueprint in app.py with the two-line patch shown in the
-adjacent README.md. The existing /api/phase-boundary and
-/api/suggest-experiments endpoints are NOT modified.
+Three endpoints, registered as a Flask Blueprint into the existing app:
+    POST /api/kinetics-fit              — replication-kinetics ODE fit per group
+    POST /api/kinetics-suggest          — RandomForest active learning
+    POST /api/kinetics-sequence-predict — greedy sequence optimization
+
+The kinetic model below is the same antimony-defined replication system that
+is used in the wet-lab Tellurium notebook. It is implemented here directly
+via scipy.integrate.solve_ivp so the backend does not require the heavy
+Tellurium / libroadrunner native stack on Render — same math, lighter deploy.
+
+Antimony reference (matches the notebook verbatim):
+
+    model replication_kinetics
+        var A, a, B, b, Aa, Bb, R
+        J1: A + a -> Aa;     ku * A * a
+        J2: B + b -> Bb;     ku * B * b
+        J3: Aa + Bb -> R;    k1 * Aa * Bb - k2 * R
+        J4: A + a + Bb -> R; kr * A * a * R
+        J5: B + b + Aa -> R; kr * B * b * R
+        ku = 0.01; k1 = 1.0; k2 = 1.0; kr = 1.0;
+        A = 2.8; a = 2.8; B = 1.4; b = 1.4; Aa = 0; Bb = 0; R = 0;
+    end
 """
 from flask import Blueprint, request, jsonify
 import numpy as np
-from scipy.optimize import curve_fit
+from scipy.integrate import solve_ivp
+from scipy.optimize import least_squares
 from sklearn.ensemble import RandomForestRegressor
 
 lida_bp = Blueprint('lida_kinetics', __name__, url_prefix='/api')
 
 BASES = ['A', 'C', 'G', 'T']
 
-
-# ────────────── helpers ──────────────
-
-def _first_order(t, Cmax, k):
-    return Cmax * (1.0 - np.exp(-k * np.asarray(t)))
-
-
-def _sigmoidal(t, Cmax, k, t50):
-    return Cmax / (1.0 + np.exp(-k * (np.asarray(t) - t50)))
+# Default initial concentrations (uM) — match the notebook's antimony defaults.
+DEFAULT_A0 = 2.8
+DEFAULT_B0 = 1.4
+DEFAULT_LIMIT_UM = 1.4   # Max yieldable [R] (uM); matches LIMIT_B in the notebook.
 
 
-def _aic(y, yhat, k_params):
-    n = len(y)
-    rss = float(np.sum((np.asarray(y) - np.asarray(yhat)) ** 2))
-    if rss <= 0:
-        return -np.inf
-    return n * np.log(rss / n) + 2 * k_params
+# ════════════════════════════════════════════════════════════════════════
+# Replication kinetics ODE
+# ════════════════════════════════════════════════════════════════════════
 
+def _replication_ode(t, y, ku, k1, k2, kr):
+    A, a, B, b, Aa, Bb, R = y
+    rJ1 = ku * A * a               # A + a -> Aa
+    rJ2 = ku * B * b               # B + b -> Bb
+    rJ3 = k1 * Aa * Bb - k2 * R    # Aa + Bb <-> R
+    rJ4 = kr * A * a * R           # A + a + Bb -> R   (autocatalytic in R)
+    rJ5 = kr * B * b * R           # B + b + Aa -> R   (autocatalytic in R)
+
+    dA  = -rJ1 - rJ4
+    da  = -rJ1 - rJ4
+    dB  = -rJ2 - rJ5
+    db  = -rJ2 - rJ5
+    dAa =  rJ1 - rJ3 - rJ5         # Aa consumed by J3 (forward) and J5
+    dBb =  rJ2 - rJ3 - rJ4         # Bb consumed by J3 (forward) and J4
+    dR  =  rJ3 + rJ4 + rJ5
+    return [dA, da, dB, db, dAa, dBb, dR]
+
+
+def _simulate_R(params, initial_R, times, A0, B0):
+    """Integrate the replication ODE; return [R](t) interpolated at `times`."""
+    ku, k1, k2, kr = params
+    y0 = [A0, A0, B0, B0, 0.0, 0.0, float(initial_R)]
+    t_max = float(np.max(times)) + 5.0
+    try:
+        t_grid = np.linspace(0.0, t_max, 120)
+        sol = solve_ivp(
+            _replication_ode, (0.0, t_max), y0,
+            args=(ku, k1, k2, kr),
+            t_eval=t_grid, method='LSODA',
+            rtol=1e-6, atol=1e-9,
+        )
+        if not sol.success:
+            return None, None, None
+        R_vals = sol.y[6]
+        R_at_t = np.interp(np.asarray(times, dtype=float), sol.t, R_vals)
+        return R_at_t, sol.t, R_vals
+    except Exception:
+        return None, None, None
+
+
+def _residuals(params, t_data, y_data, initial_R, A0, B0):
+    """Concentration-domain residuals; large penalty for negative-slope simulations."""
+    if np.any(np.array(params) < 0):
+        return np.full_like(y_data, 1e6)
+    y_sim, _, _ = _simulate_R(params, initial_R, t_data, A0, B0)
+    if y_sim is None or np.any(np.isnan(y_sim)):
+        return np.full_like(y_data, 1e6)
+    diffs = np.diff(y_sim)
+    penalty = 1e6 if np.any(diffs < -1e-5) else 0.0
+    return (y_sim - y_data) + penalty
+
+
+def _build_initial_guesses():
+    """Mirror the notebook's multi-start pool (4 hand-picked + 6 random log-uniform)."""
+    rng = np.random.default_rng(42)
+    guesses = [
+        [1e-6, 1e-3, 1e-11, 1e-6],
+        [1e-3, 1e-1, 1e-11, 1e-1],
+        [1e-2, 1.0,  1e-11, 1.0 ],
+        [1e-5, 1.0,  1e-11, 10.0],
+    ]
+    for _ in range(6):
+        g = np.power(10.0, rng.uniform(-4.0, 1.5, size=4)).tolist()
+        g[2] = 1e-11
+        guesses.append(g)
+    return guesses
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Featurisation for AL/sequence-prediction endpoints
+# ════════════════════════════════════════════════════════════════════════
 
 def _encode_sequence(seq, max_len):
-    """One-hot encode a sequence into a (max_len * 4) vector. Pad with zeros."""
     out = np.zeros(max_len * 4, dtype=float)
     for i, b in enumerate(seq[:max_len]):
         if b in BASES:
@@ -67,59 +148,113 @@ def _max_yield(exp):
     return float(max(p['conversion'] for p in tc))
 
 
-# ────────────── endpoints ──────────────
+# ════════════════════════════════════════════════════════════════════════
+# Endpoints
+# ════════════════════════════════════════════════════════════════════════
 
 @lida_bp.route('/kinetics-fit', methods=['POST'])
 def kinetics_fit():
+    """
+    Fit the replication-kinetics ODE per experiment group. Each group's
+    `timeCourse` is treated as conversion (%); we convert to [R] in uM by
+    multiplying by `limit_uM` / 100 and then fit (ku, k1, k2, kr).
+
+    Request:
+      {
+        experiments: [{ groupId, sequence, conditions: {temperature, ligase, atp, mg2, env}, timeCourse: [{time, conversion}], limit_uM? }],
+        limit_uM?: 1.4,    # default per-group ceiling concentration in uM
+        A0?: 2.8,          # initial [A] = [a] (uM), default 2.8
+        B0?: 1.4           # initial [B] = [b] (uM), default 1.4
+      }
+
+    Response:
+      { fits: [{ groupId, model, ku, k1, k2, kr, k_bg, limit_uM, seed_uM, cost, simT, simY }],
+        summary: { topGroups, trendNotes } }
+    """
     body = request.get_json(force=True) or {}
     experiments = body.get('experiments', [])
+    default_limit = float(body.get('limit_uM', DEFAULT_LIMIT_UM))
+    A0 = float(body.get('A0', DEFAULT_A0))
+    B0 = float(body.get('B0', DEFAULT_B0))
+
     fits = []
+    guesses = _build_initial_guesses()
+
     for g in experiments:
+        gid = g.get('groupId')
         tc = g.get('timeCourse', [])
         if len(tc) < 3:
-            fits.append({'groupId': g['groupId'], 'Cmax': None, 'k': None, 't50': None, 'model': None})
+            fits.append({'groupId': gid, 'model': None,
+                         'ku': None, 'k1': None, 'k2': None, 'kr': None, 'k_bg': None,
+                         'limit_uM': None, 'seed_uM': None, 'cost': None,
+                         'simT': [], 'simY': [], 'note': 'Need at least 3 timepoints.'})
             continue
-        t = [p['time'] for p in tc]
-        y = [p['conversion'] for p in tc]
-        best = None
-        for name, fn, p0, k_params in [
-            ('first_order', _first_order, [max(y), 0.05], 2),
-            ('sigmoidal',   _sigmoidal,   [max(y), 0.1, float(np.median(t))], 3),
-        ]:
+
+        limit_uM = float(g.get('limit_uM', default_limit))
+        env = ((g.get('conditions') or {}).get('env') or '')
+        seed_pct = 0.05 if 'seed' in str(env).lower() else 0.0
+
+        t_data = np.array([float(p['time']) for p in tc], dtype=float)
+        y_pct = np.array([float(p['conversion']) for p in tc], dtype=float)
+        order = np.argsort(t_data)
+        t_data = t_data[order]
+        y_pct = y_pct[order]
+
+        # Convert conversion (%) → concentration (uM)
+        y_data = (y_pct / 100.0) * limit_uM
+        # Initial [R] = 5% of mean observed conversion if env contains "seed", else 0
+        initial_R = float(seed_pct * np.mean(y_data))
+
+        best_res, best_cost = None, np.inf
+        for p0 in guesses:
             try:
-                popt, _ = curve_fit(fn, t, y, p0=p0, maxfev=4000)
-                yhat = fn(t, *popt)
-                aic = _aic(y, yhat, k_params)
-                if best is None or aic < best['aic']:
-                    best = {'name': name, 'popt': popt.tolist(), 'aic': aic}
+                res = least_squares(
+                    _residuals, p0,
+                    args=(t_data, y_data, initial_R, A0, B0),
+                    bounds=([0.0, 0.0, 0.0, 0.0], [100.0, 100.0, 1e-10, 100.0]),
+                    ftol=1e-8, xtol=1e-8, max_nfev=200,
+                )
+                if res.success and res.cost < best_cost:
+                    best_cost = res.cost
+                    best_res = res
             except Exception:
                 continue
-        if best is None:
-            fits.append({'groupId': g['groupId'], 'Cmax': None, 'k': None, 't50': None, 'model': None})
-        elif best['name'] == 'first_order':
-            fits.append({
-                'groupId': g['groupId'],
-                'Cmax': best['popt'][0],
-                'k': best['popt'][1],
-                't50': None,
-                'model': 'first_order',
-            })
-        else:
-            fits.append({
-                'groupId': g['groupId'],
-                'Cmax': best['popt'][0],
-                'k': best['popt'][1],
-                't50': best['popt'][2],
-                'model': 'sigmoidal',
-            })
+
+        if best_res is None:
+            fits.append({'groupId': gid, 'model': None,
+                         'ku': None, 'k1': None, 'k2': None, 'kr': None, 'k_bg': None,
+                         'limit_uM': limit_uM, 'seed_uM': initial_R, 'cost': None,
+                         'simT': [], 'simY': [], 'note': 'Fit did not converge.'})
+            continue
+
+        ku, k1, k2, kr = best_res.x
+        # High-resolution simulated curve for frontend overlay (returned in % units).
+        _, sim_t, sim_R = _simulate_R(best_res.x, initial_R, t_data, A0, B0)
+        sim_y_pct = (sim_R / limit_uM) * 100.0 if sim_R is not None else None
+
+        fits.append({
+            'groupId': gid,
+            'model': 'replication_kinetics',
+            'ku':    float(ku),
+            'k1':    float(k1),
+            'k2':    float(k2),
+            'kr':    float(kr),
+            'k_bg':  float(ku * k1),       # background formation rate ku·k1
+            'limit_uM': limit_uM,
+            'seed_uM':  initial_R,
+            'cost':     float(best_cost),
+            'simT':  sim_t.tolist() if sim_t is not None else [],
+            'simY':  sim_y_pct.tolist() if sim_y_pct is not None else [],
+        })
 
     ranked = sorted(experiments, key=_max_yield, reverse=True)[:5]
     top_max = _max_yield(ranked[0]) if ranked else 0.0
+    fitted = sum(1 for f in fits if f.get('ku') is not None)
     return jsonify({
         'fits': fits,
         'summary': {
-            'topGroups': [{'groupId': g['groupId'], 'maxConversion': _max_yield(g)} for g in ranked],
-            'trendNotes': f"{len(fits)} groups fitted; top yield {top_max:.1f}%.",
+            'topGroups': [{'groupId': g.get('groupId'), 'maxConversion': _max_yield(g)} for g in ranked],
+            'trendNotes': f"{fitted}/{len(fits)} groups fitted with replication kinetics; top yield {top_max:.1f}%.",
         },
     })
 
@@ -196,7 +331,6 @@ def kinetics_sequence_predict():
     rng = np.random.default_rng()
     candidates = []
     for _ in range(topK):
-        # Greedy hill-climb until no single-position change improves yield.
         improved = True
         while improved:
             improved = False
@@ -212,7 +346,6 @@ def kinetics_sequence_predict():
                     seq[i] = best_b
                     improved = True
 
-        # Per-position score grid (4 bases × max_len) for the optimum.
         per_pos = []
         for i in range(max_len):
             scores = {}
@@ -230,7 +363,6 @@ def kinetics_sequence_predict():
             'perPositionScore': per_pos,
         })
 
-        # Perturb one position to seed the next candidate.
         idx = int(rng.integers(0, max_len))
         seq[idx] = str(rng.choice([b for b in BASES if b != seq[idx]]))
 
