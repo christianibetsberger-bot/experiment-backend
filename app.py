@@ -6,11 +6,12 @@ from sklearn.ensemble import RandomForestClassifier
 from scipy.spatial import distance_matrix
 from scipy.ndimage import gaussian_filter
 from itertools import combinations
+from lida_kinetics import lida_bp
 import os
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
-
+app.register_blueprint(lida_bp)
 RANDOM_STATE = 42
 
 def safe_float(val, fallback):
