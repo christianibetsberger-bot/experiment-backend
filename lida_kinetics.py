@@ -84,7 +84,8 @@ def _simulate_R_at(params, initial_R, t_eval, A0, B0):
 
 
 def _simulate_R_dense(params, initial_R, t_max, A0, B0, n=100):
-    """Fine-grid simulation used once per group for the frontend overlay."""
+    """Fine-grid simulation used once per group for the frontend overlay.
+    LSODA is fast here; tight tolerances give display-quality accuracy."""
     ku, k1, k2, kr = params
     y0 = [A0, A0, B0, B0, 0.0, 0.0, float(initial_R)]
     t_grid = np.linspace(0.0, t_max, n)
@@ -92,8 +93,8 @@ def _simulate_R_dense(params, initial_R, t_max, A0, B0, n=100):
         sol = solve_ivp(
             _replication_ode, (0.0, t_max), y0,
             args=(ku, k1, k2, kr),
-            t_eval=t_grid, method='BDF',
-            rtol=1e-8, atol=1e-10,
+            t_eval=t_grid, method='LSODA',
+            rtol=1e-6, atol=1e-9,
         )
         if not sol.success:
             return None, None
@@ -232,7 +233,7 @@ def kinetics_fit():
                     _residuals, p0,
                     args=(t_data, y_data, initial_R, A0, B0),
                     bounds=([0.0, 0.0, 0.0, 0.0], [100.0, 100.0, 1e-10, 100.0]),
-                    ftol=1e-8, max_nfev=300,
+                    ftol=1e-8, max_nfev=80,
                 )
                 if res.success and res.cost < best_cost:
                     best_cost = res.cost
