@@ -64,8 +64,7 @@ def _replication_ode(t, y, ku, k1, k2, kr):
 
 def _simulate_R_at(params, initial_R, t_eval, A0, B0):
     """Integrate the replication ODE and return [R] at the supplied time points.
-    Uses LSODA in the fitting hot loop — fast, adequate accuracy for the optimizer
-    to find the correct minimum. BDF is reserved for the display-quality dense pass."""
+    Used in the fitting hot loop — loose tolerances keep each ODE call fast."""
     ku, k1, k2, kr = params
     y0 = [A0, A0, B0, B0, 0.0, 0.0, float(initial_R)]
     t_max = float(t_eval[-1]) + 1e-6
@@ -74,7 +73,7 @@ def _simulate_R_at(params, initial_R, t_eval, A0, B0):
             _replication_ode, (0.0, t_max), y0,
             args=(ku, k1, k2, kr),
             t_eval=t_eval, method='LSODA',
-            rtol=1e-5, atol=1e-8,
+            rtol=1e-4, atol=1e-7,
         )
         if not sol.success:
             return None
@@ -116,21 +115,13 @@ def _residuals(params, t_data, y_data, initial_R, A0, B0):
 
 
 def _build_initial_guesses():
-    """14 multi-start seeds matching the notebook exactly:
-    4 hand-picked + 10 log-uniform random (numpy seed 42), k2 pinned to 1e-11."""
-    rng = np.random.RandomState(42)
-    fixed = [
+    """4 hand-picked multi-start seeds covering slow/fast/intermediate regimes."""
+    return [
         [1e-6, 1e-3, 1e-11, 1e-6],
         [1e-3, 1e-1, 1e-11, 1e-1],
         [1e-2, 1.0,  1e-11, 1.0 ],
         [1e-5, 1.0,  1e-11, 10.0],
     ]
-    random_starts = []
-    for _ in range(10):
-        g = np.power(10, rng.uniform(-4, 1.5, size=4)).tolist()
-        g[2] = 1e-11
-        random_starts.append(g)
-    return fixed + random_starts
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -233,7 +224,7 @@ def kinetics_fit():
                     _residuals, p0,
                     args=(t_data, y_data, initial_R, A0, B0),
                     bounds=([0.0, 0.0, 0.0, 0.0], [100.0, 100.0, 1e-10, 100.0]),
-                    ftol=1e-8, max_nfev=80,
+                    ftol=1e-6, max_nfev=80,
                 )
                 if res.success and res.cost < best_cost:
                     best_cost = res.cost
