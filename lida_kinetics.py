@@ -62,9 +62,10 @@ def _replication_ode(t, y, ku, k1, k2, kr):
     return [dA, da, dB, db, dAa, dBb, dR]
 
 
-def _simulate_R_at(params, initial_R, t_eval, A0, B0, rtol=1e-4, atol=1e-7):
-    """Integrate the replication ODE and return [R] at the supplied time points only.
-    Used in the fitting hot loop — looser tolerances + no extra grid points."""
+def _simulate_R_at(params, initial_R, t_eval, A0, B0):
+    """Integrate the replication ODE and return [R] at the supplied time points.
+    Uses BDF (scipy's closest equivalent to Tellurium's CVODE) with tight tolerances
+    matching the notebook's CVODE defaults."""
     ku, k1, k2, kr = params
     y0 = [A0, A0, B0, B0, 0.0, 0.0, float(initial_R)]
     t_max = float(t_eval[-1]) + 1e-6
@@ -72,8 +73,8 @@ def _simulate_R_at(params, initial_R, t_eval, A0, B0, rtol=1e-4, atol=1e-7):
         sol = solve_ivp(
             _replication_ode, (0.0, t_max), y0,
             args=(ku, k1, k2, kr),
-            t_eval=t_eval, method='LSODA',
-            rtol=rtol, atol=atol,
+            t_eval=t_eval, method='BDF',
+            rtol=1e-6, atol=1e-9,
         )
         if not sol.success:
             return None
@@ -91,8 +92,8 @@ def _simulate_R_dense(params, initial_R, t_max, A0, B0, n=100):
         sol = solve_ivp(
             _replication_ode, (0.0, t_max), y0,
             args=(ku, k1, k2, kr),
-            t_eval=t_grid, method='LSODA',
-            rtol=1e-6, atol=1e-9,
+            t_eval=t_grid, method='BDF',
+            rtol=1e-8, atol=1e-10,
         )
         if not sol.success:
             return None, None
@@ -114,15 +115,21 @@ def _residuals(params, t_data, y_data, initial_R, A0, B0):
 
 
 def _build_initial_guesses():
-    """Compact multi-start pool. The notebook uses 14 starts on a fast local CPU;
-    Render's shared CPU is ~10x slower so we keep 4 hand-picked seeds covering
-    the same orders-of-magnitude slow/fast/intermediate regimes."""
-    return [
+    """14 multi-start seeds matching the notebook exactly:
+    4 hand-picked + 10 log-uniform random (numpy seed 42), k2 pinned to 1e-11."""
+    rng = np.random.RandomState(42)
+    fixed = [
         [1e-6, 1e-3, 1e-11, 1e-6],
         [1e-3, 1e-1, 1e-11, 1e-1],
         [1e-2, 1.0,  1e-11, 1.0 ],
         [1e-5, 1.0,  1e-11, 10.0],
     ]
+    random_starts = []
+    for _ in range(10):
+        g = np.power(10, rng.uniform(-4, 1.5, size=4)).tolist()
+        g[2] = 1e-11
+        random_starts.append(g)
+    return fixed + random_starts
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -219,23 +226,17 @@ def kinetics_fit():
         initial_R = float(seed_pct * np.mean(y_data))
 
         best_res, best_cost = None, np.inf
-        # Cost is sum-of-squares of residuals (in uM^2). For data spanning 0..limit_uM
-        # a residual of 1% of limit is ~1e-4 per point — a cost below that level is
-        # effectively a converged fit, so we can skip remaining starts.
-        good_enough = max(1e-4, 1e-4 * (limit_uM ** 2) * len(t_data))
         for p0 in guesses:
             try:
                 res = least_squares(
                     _residuals, p0,
                     args=(t_data, y_data, initial_R, A0, B0),
                     bounds=([0.0, 0.0, 0.0, 0.0], [100.0, 100.0, 1e-10, 100.0]),
-                    ftol=1e-6, xtol=1e-6, max_nfev=80,
+                    ftol=1e-8,
                 )
                 if res.success and res.cost < best_cost:
                     best_cost = res.cost
                     best_res = res
-                    if best_cost < good_enough:
-                        break
             except Exception:
                 continue
 
