@@ -91,7 +91,10 @@ def _simulate_R_at(params, initial_R, t_eval, A0, B0, rtol=1e-4, atol=1e-7):
             t_eval=t_eval, method='LSODA',
             rtol=rtol, atol=atol,
         )
-        return sol.y[6] if sol.success else None
+        if not sol.success:
+            return None
+        R = sol.y[6]
+        return None if (np.any(np.isnan(R)) or np.any(np.isinf(R))) else R
     except Exception:
         return None
 
@@ -107,9 +110,19 @@ def _simulate_R_dense(params, initial_R, t_max, A0, B0, n=100):
             t_eval=t_grid, method='LSODA',
             rtol=1e-6, atol=1e-9,
         )
-        return (sol.t, sol.y[6]) if sol.success else (None, None)
+        if not sol.success:
+            return None, None
+        R = sol.y[6]
+        if np.any(np.isnan(R)) or np.any(np.isinf(R)):
+            return None, None
+        return sol.t, R
     except Exception:
         return None, None
+
+
+def _safe_floats(arr):
+    """Convert array to list, replacing NaN/Inf with None for valid JSON."""
+    return [float(v) if np.isfinite(v) else None for v in arr]
 
 
 def _residuals(params, t_data, y_data, initial_R, A0, B0):
@@ -267,69 +280,80 @@ def kinetics_fit():
 
     for g in experiments:
         gid = g.get('groupId')
-        tc  = g.get('timeCourse', [])
-        if len(tc) < 3:
+        try:
+            tc  = g.get('timeCourse', [])
+            if len(tc) < 3:
+                fits.append({'groupId': gid, 'model': None,
+                             'ku': None, 'k1': None, 'k2': None, 'kr': None, 'k_bg': None,
+                             'limit_uM': None, 'seed_uM': None, 'cost': None,
+                             'simT': [], 'simY': [], 'note': 'Need at least 3 timepoints.'})
+                continue
+
+            limit_uM = float(g.get('limit_uM', default_lim))
+            env      = ((g.get('conditions') or {}).get('env') or '')
+            seed_pct = 0.05 if 'seed' in str(env).lower() else 0.0
+
+            t_data = np.array([float(p['time'])       for p in tc], dtype=float)
+            y_pct  = np.array([float(p['conversion'])  for p in tc], dtype=float)
+            order  = np.argsort(t_data)
+            t_data, y_pct = t_data[order], y_pct[order]
+
+            y_data    = (y_pct / 100.0) * limit_uM
+            initial_R = float(seed_pct * np.mean(y_data))
+
+            best_res, best_cost = None, np.inf
+            good_enough = max(1e-4, 1e-4 * (limit_uM ** 2) * len(t_data))
+
+            for p0 in guesses:
+                try:
+                    res = least_squares(
+                        _residuals, p0,
+                        args=(t_data, y_data, initial_R, A0, B0),
+                        # k2 upper bound raised from 1e-10 → 10.0 so the optimizer
+                        # is not forced to the boundary; boundary convergence caused
+                        # the dense post-fit simulation to diverge (NaN/Inf) for some
+                        # groups, producing invalid JSON that the browser couldn't parse.
+                        bounds=([0.0]*4, [100.0, 100.0, 10.0, 100.0]),
+                        ftol=1e-6, xtol=1e-6, max_nfev=80,
+                    )
+                    if res.success and res.cost < best_cost:
+                        best_cost, best_res = res.cost, res
+                        if best_cost < good_enough:
+                            break
+                except Exception:
+                    continue
+
+            if best_res is None:
+                fits.append({'groupId': gid, 'model': None,
+                             'ku': None, 'k1': None, 'k2': None, 'kr': None, 'k_bg': None,
+                             'limit_uM': limit_uM, 'seed_uM': initial_R, 'cost': None,
+                             'simT': [], 'simY': [], 'note': 'Fit did not converge.'})
+                continue
+
+            ku, k1, k2, kr = best_res.x
+            sim_t, sim_R   = _simulate_R_dense(best_res.x, initial_R, float(t_data[-1]) + 5.0, A0, B0)
+            sim_y_pct      = (sim_R / limit_uM) * 100.0 if sim_R is not None else None
+
+            fits.append({
+                'groupId': gid,
+                'model':   'replication_kinetics',
+                'ku':      float(ku),
+                'k1':      float(k1),
+                'k2':      float(k2),
+                'kr':      float(kr),
+                'k_bg':    float(ku * k1),
+                'limit_uM': limit_uM,
+                'seed_uM':  initial_R,
+                'cost':     float(best_cost),
+                'simT':  _safe_floats(sim_t)     if sim_t     is not None else [],
+                'simY':  _safe_floats(sim_y_pct) if sim_y_pct is not None else [],
+            })
+
+        except Exception as exc:
             fits.append({'groupId': gid, 'model': None,
                          'ku': None, 'k1': None, 'k2': None, 'kr': None, 'k_bg': None,
                          'limit_uM': None, 'seed_uM': None, 'cost': None,
-                         'simT': [], 'simY': [], 'note': 'Need at least 3 timepoints.'})
-            continue
-
-        limit_uM = float(g.get('limit_uM', default_lim))
-        env      = ((g.get('conditions') or {}).get('env') or '')
-        seed_pct = 0.05 if 'seed' in str(env).lower() else 0.0
-
-        t_data = np.array([float(p['time'])       for p in tc], dtype=float)
-        y_pct  = np.array([float(p['conversion'])  for p in tc], dtype=float)
-        order  = np.argsort(t_data)
-        t_data, y_pct = t_data[order], y_pct[order]
-
-        y_data    = (y_pct / 100.0) * limit_uM
-        initial_R = float(seed_pct * np.mean(y_data))
-
-        best_res, best_cost = None, np.inf
-        good_enough = max(1e-4, 1e-4 * (limit_uM ** 2) * len(t_data))
-
-        for p0 in guesses:
-            try:
-                res = least_squares(
-                    _residuals, p0,
-                    args=(t_data, y_data, initial_R, A0, B0),
-                    bounds=([0.0]*4, [100.0, 100.0, 1e-10, 100.0]),
-                    ftol=1e-6, xtol=1e-6, max_nfev=80,
-                )
-                if res.success and res.cost < best_cost:
-                    best_cost, best_res = res.cost, res
-                    if best_cost < good_enough:
-                        break
-            except Exception:
-                continue
-
-        if best_res is None:
-            fits.append({'groupId': gid, 'model': None,
-                         'ku': None, 'k1': None, 'k2': None, 'kr': None, 'k_bg': None,
-                         'limit_uM': limit_uM, 'seed_uM': initial_R, 'cost': None,
-                         'simT': [], 'simY': [], 'note': 'Fit did not converge.'})
-            continue
-
-        ku, k1, k2, kr = best_res.x
-        sim_t, sim_R   = _simulate_R_dense(best_res.x, initial_R, float(t_data[-1]) + 5.0, A0, B0)
-        sim_y_pct      = (sim_R / limit_uM) * 100.0 if sim_R is not None else None
-
-        fits.append({
-            'groupId': gid,
-            'model':   'replication_kinetics',
-            'ku':      float(ku),
-            'k1':      float(k1),
-            'k2':      float(k2),
-            'kr':      float(kr),
-            'k_bg':    float(ku * k1),
-            'limit_uM': limit_uM,
-            'seed_uM':  initial_R,
-            'cost':     float(best_cost),
-            'simT':  sim_t.tolist()     if sim_t     is not None else [],
-            'simY':  sim_y_pct.tolist() if sim_y_pct is not None else [],
-        })
+                         'simT': [], 'simY': [], 'note': f'Unexpected error: {exc}'})
 
     ranked  = sorted(experiments, key=_max_yield, reverse=True)[:5]
     top_max = _max_yield(ranked[0]) if ranked else 0.0
