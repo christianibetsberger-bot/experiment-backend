@@ -31,6 +31,7 @@ Active-learning strategy — METIS (doi:10.1101/2021.12.28.474323):
     kappa = 3   → pure explore (maximise model uncertainty)
 """
 from flask import Blueprint, request, jsonify
+import time
 import numpy as np
 import pandas as pd
 from scipy.integrate import solve_ivp
@@ -136,8 +137,9 @@ def _residuals(params, t_data, y_data, initial_R, A0, B0):
 
 
 def _build_initial_guesses():
+    # Three guesses spanning the biologically relevant range.
+    # Removed the extreme-slow guess (1e-6) to reduce per-group compute time.
     return [
-        [1e-6, 1e-3, 1e-11, 1e-6],
         [1e-3, 1e-1, 1e-11, 1e-1],
         [1e-2, 1.0,  1e-11, 1.0 ],
         [1e-5, 1.0,  1e-11, 10.0],
@@ -275,11 +277,24 @@ def kinetics_fit():
     A0          = float(body.get('A0', DEFAULT_A0))
     B0          = float(body.get('B0', DEFAULT_B0))
 
-    fits    = []
-    guesses = _build_initial_guesses()
+    fits      = []
+    guesses   = _build_initial_guesses()
+    t_start   = time.time()
+    TIME_BUDGET = 100  # seconds — stay inside gunicorn's 120 s worker timeout
 
     for g in experiments:
         gid = g.get('groupId')
+
+        if time.time() - t_start > TIME_BUDGET:
+            fits.append({
+                'groupId': gid, 'model': None,
+                'ku': None, 'k1': None, 'k2': None, 'kr': None, 'k_bg': None,
+                'limit_uM': None, 'seed_uM': None, 'cost': None,
+                'simT': [], 'simY': [],
+                'note': 'Time budget reached — re-fit with fewer groups or split the dataset.',
+            })
+            continue
+
         try:
             tc  = g.get('timeCourse', [])
             if len(tc) < 3:
@@ -309,12 +324,8 @@ def kinetics_fit():
                     res = least_squares(
                         _residuals, p0,
                         args=(t_data, y_data, initial_R, A0, B0),
-                        # k2 upper bound raised from 1e-10 → 10.0 so the optimizer
-                        # is not forced to the boundary; boundary convergence caused
-                        # the dense post-fit simulation to diverge (NaN/Inf) for some
-                        # groups, producing invalid JSON that the browser couldn't parse.
-                        bounds=([0.0]*4, [100.0, 100.0, 10.0, 100.0]),
-                        ftol=1e-6, xtol=1e-6, max_nfev=80,
+                        bounds=([0.0]*4, [100.0, 100.0, 0.1, 100.0]),
+                        ftol=1e-6, xtol=1e-6, max_nfev=60,
                     )
                     if res.success and res.cost < best_cost:
                         best_cost, best_res = res.cost, res
