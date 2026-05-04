@@ -390,17 +390,25 @@ def kinetics_suggest():
 
     ensemble = _build_ensemble(X, y, ensemble_size=ensemble_size)
 
+    # Candidates use only the sequences already studied — METIS explores the
+    # condition space for those specific strands, not unvalidated new sequences.
+    observed_seqs = [e.get('sequence', '') for e in exps]
+    per_seq = max(1, pool_size // len(observed_seqs))
     rng = np.random.default_rng()
-    cand_exps = [{
-        'sequence': ''.join(rng.choice(BASES, size=max_len)),
-        'conditions': {
-            'temperature': float(rng.uniform(ranges.get('tMin', 20),     ranges.get('tMax', 50))),
-            'ligase':      float(rng.uniform(ranges.get('ligaseMin', 0),  ranges.get('ligaseMax', 10))),
-            'atp':         float(rng.uniform(ranges.get('atpMin', 0),     ranges.get('atpMax', 10))),
-            'mg2':         float(rng.uniform(ranges.get('mg2Min', 0),     ranges.get('mg2Max', 20))),
-            'env':         str(rng.choice(env_vocab)),
-        },
-    } for _ in range(pool_size)]
+    cand_exps = []
+    for seq in observed_seqs:
+        for _ in range(per_seq):
+            cand_exps.append({
+                'sequence': seq,
+                'conditions': {
+                    'temperature': float(rng.uniform(ranges.get('tMin', 20),     ranges.get('tMax', 50))),
+                    'ligase':      float(rng.uniform(ranges.get('ligaseMin', 0),  ranges.get('ligaseMax', 10))),
+                    'atp':         float(rng.uniform(ranges.get('atpMin', 0),     ranges.get('atpMax', 10))),
+                    'mg2':         float(rng.uniform(ranges.get('mg2Min', 0),     ranges.get('mg2Max', 20))),
+                    'env':         str(rng.choice(env_vocab)),
+                },
+            })
+    cand_exps = cand_exps[:pool_size]
 
     Xc            = np.asarray([_featurize(c, max_len, env_vocab) for c in cand_exps])
     mean, std, ucb = _ucb_score(ensemble, Xc, kappa)
@@ -423,15 +431,18 @@ def kinetics_suggest():
 @lida_bp.route('/kinetics-sequence-predict', methods=['POST'])
 def kinetics_sequence_predict():
     """
-    Greedy per-position hill-climb using the METIS XGBoost ensemble.
-    Starts from the best observed sequence; returns topK diverse candidates.
+    Find high-yield DNA sequences by scoring a random pool against ALL observed
+    conditions. Each candidate sequence is rated by its mean (and std) predicted
+    conversion averaged over every condition set in the dataset, so the returned
+    sequences are predicted to perform well across the entire condition space —
+    not just at one fixed operating point.
 
     Request:
       {
-        experiments:     [...],
-        fixedConditions: { temperature, ligase, atp, mg2, env } | null,
-        topK:            5,
-        ensembleSize:    20,
+        experiments:  [...],   # groups with sequence + conditions + maxConversion
+        topK:         5,
+        ensembleSize: 20,
+        poolSize:     2000,    # random-sequence pool size (default smaller than suggest)
       }
 
     Response:
@@ -443,9 +454,9 @@ def kinetics_sequence_predict():
     if not exps:
         return jsonify({'candidates': []})
 
-    fixed         = body.get('fixedConditions')
     topK          = int(body.get('topK', 5))
     ensemble_size = int(body.get('ensembleSize', 20))
+    pool_size     = int(body.get('poolSize', 2000))
 
     max_len   = max(len(e.get('sequence', '')) for e in exps) or 1
     env_vocab = sorted({(e.get('conditions') or {}).get('env', 'none') for e in exps})
@@ -455,55 +466,56 @@ def kinetics_sequence_predict():
 
     ensemble = _build_ensemble(X, y, ensemble_size=ensemble_size)
 
-    best_exp = max(exps, key=_max_yield)
-    cond     = fixed or best_exp['conditions']
-    seq      = list(best_exp.get('sequence', 'A' * max_len))
-    if len(seq) < max_len:
-        seq += ['A'] * (max_len - len(seq))
+    obs_conditions = [e['conditions'] for e in exps]
+    n_cond = len(obs_conditions)
+    rng = np.random.default_rng()
 
-    def _score_variants(seq_list, pos):
-        """Batch-predict ensemble mean yield for all 4 bases at position `pos`."""
-        feats = []
-        for b in BASES:
-            tmp = seq_list.copy()
-            tmp[pos] = b
-            feats.append(_featurize({'sequence': ''.join(tmp), 'conditions': cond},
-                                    max_len, env_vocab))
-        preds = np.column_stack([m.predict(np.asarray(feats)) for m in ensemble])
-        return preds.mean(axis=1)   # shape (4,)
+    # Build pool of random candidate sequences.
+    cand_seqs = [''.join(rng.choice(BASES, size=max_len)) for _ in range(pool_size)]
 
-    rng        = np.random.default_rng()
+    # Score every (sequence, observed_condition) pair in one batch, then average
+    # over conditions per sequence. This finds sequences that are broadly good
+    # rather than optimal only at one condition point.
+    all_feats = np.asarray([
+        _featurize({'sequence': seq, 'conditions': cond}, max_len, env_vocab)
+        for seq in cand_seqs
+        for cond in obs_conditions
+    ])  # shape: (pool_size * n_cond, n_features)
+
+    preds_flat = np.column_stack([m.predict(all_feats) for m in ensemble])
+    # (pool_size * n_cond, n_models) → (pool_size, n_cond, n_models)
+    preds_3d = preds_flat.reshape(pool_size, n_cond, len(ensemble))
+
+    # Mean yield: average over conditions and ensemble models
+    seq_means = preds_3d.mean(axis=(1, 2))          # (pool_size,)
+    # Uncertainty: mean ensemble std over conditions
+    seq_stds  = preds_3d.std(axis=2).mean(axis=1)   # (pool_size,)
+
+    top_idx = np.argsort(seq_means)[::-1][:topK]
+
+    # For each top sequence, compute per-position importance by mutating one base
+    # at a time and averaging the prediction change over observed conditions.
     candidates = []
-    MAX_PASSES = 3
+    for i in top_idx:
+        seq_chars = list(cand_seqs[i])
+        per_pos = []
+        for pos in range(max_len):
+            pos_scores = {}
+            for b in BASES:
+                tmp = seq_chars.copy(); tmp[pos] = b
+                feats = np.asarray([
+                    _featurize({'sequence': ''.join(tmp), 'conditions': c}, max_len, env_vocab)
+                    for c in obs_conditions
+                ])
+                p = np.column_stack([m.predict(feats) for m in ensemble])
+                pos_scores[b] = round(float(p.mean()), 2)
+            per_pos.append(pos_scores)
 
-    for _ in range(topK):
-        improved, passes = True, 0
-        while improved and passes < MAX_PASSES:
-            improved, passes = False, passes + 1
-            for i in range(max_len):
-                means = _score_variants(seq, i)
-                best_idx = int(np.argmax(means))
-                if seq[i] != BASES[best_idx]:
-                    seq[i] = BASES[best_idx]
-                    improved = True
-
-        per_pos = [
-            {BASES[k]: float(_score_variants(seq, i)[k]) for k in range(4)}
-            for i in range(max_len)
-        ]
-
-        feat  = _featurize({'sequence': ''.join(seq), 'conditions': cond},
-                            max_len, env_vocab).reshape(1, -1)
-        preds = np.column_stack([m.predict(feat) for m in ensemble])
         candidates.append({
-            'sequence':             ''.join(seq),
-            'predicted_conversion': round(float(preds.mean()), 2),
-            'uncertainty':          round(float(preds.std()),  2),
+            'sequence':             cand_seqs[i],
+            'predicted_conversion': round(float(seq_means[i]), 2),
+            'uncertainty':          round(float(seq_stds[i]),  2),
             'perPositionScore':     per_pos,
         })
-
-        # Perturb one random position to seed the next diverse candidate.
-        idx     = int(rng.integers(0, max_len))
-        seq[idx] = str(rng.choice([b for b in BASES if b != seq[idx]]))
 
     return jsonify({'candidates': candidates})
