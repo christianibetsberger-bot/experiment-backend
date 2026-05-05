@@ -101,24 +101,42 @@ def _simulate_R_at(params, initial_R, t_eval, A0, B0, rtol=1e-4, atol=1e-7):
 
 
 def _simulate_R_dense(params, initial_R, t_max, A0, B0, n=100):
+    """
+    Dense post-fit simulation for plotting. Tries progressively looser tolerances
+    and a fallback solver before giving up. Tight tolerances (1e-6/1e-9) used to
+    silently fail on borderline-stiff parameter combinations even though the fit
+    itself converged at 1e-4/1e-7 — that left ku/k1/k2/kr populated but simT/simY
+    empty, so the curve never rendered in the UI.
+    """
     ku, k1, k2, kr = params
     y0 = [A0, A0, B0, B0, 0.0, 0.0, float(initial_R)]
     t_grid = np.linspace(0.0, t_max, n)
-    try:
-        sol = solve_ivp(
-            _replication_ode, (0.0, t_max), y0,
-            args=(ku, k1, k2, kr),
-            t_eval=t_grid, method='LSODA',
-            rtol=1e-6, atol=1e-9,
-        )
-        if not sol.success:
-            return None, None
-        R = sol.y[6]
-        if np.any(np.isnan(R)) or np.any(np.isinf(R)):
-            return None, None
-        return sol.t, R
-    except Exception:
-        return None, None
+
+    # (method, rtol, atol) — start with the same tolerance as the fit, fall back
+    # to looser settings, then a non-stiff solver as a last resort.
+    attempts = [
+        ('LSODA', 1e-4, 1e-7),
+        ('LSODA', 1e-3, 1e-6),
+        ('LSODA', 1e-2, 1e-5),
+        ('RK45',  1e-3, 1e-6),
+    ]
+    for method, rtol, atol in attempts:
+        try:
+            sol = solve_ivp(
+                _replication_ode, (0.0, t_max), y0,
+                args=(ku, k1, k2, kr),
+                t_eval=t_grid, method=method,
+                rtol=rtol, atol=atol,
+            )
+            if not sol.success:
+                continue
+            R = sol.y[6]
+            if np.any(np.isnan(R)) or np.any(np.isinf(R)):
+                continue
+            return sol.t, R
+        except Exception:
+            continue
+    return None, None
 
 
 def _safe_floats(arr):
