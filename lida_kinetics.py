@@ -161,13 +161,23 @@ def _residuals(params, t_data, y_data, initial_R, A0, B0):
 
 
 def _build_initial_guesses():
-    # Three guesses spanning the biologically relevant range.
-    # Removed the extreme-slow guess (1e-6) to reduce per-group compute time.
-    return [
-        [1e-3, 1e-1, 1e-11, 1e-1],
-        [1e-2, 1.0,  1e-11, 1.0 ],
-        [1e-5, 1.0,  1e-11, 10.0],
+    # 4 fixed + 10 deterministic random log-uniform guesses, matching the
+    # reference Tellurium script that produced the published sigmoidal fits.
+    # k2 is always pinned to ~0 (1e-11) because LIDA is effectively
+    # irreversible — letting k2 grow lets the optimiser fall into a wrong
+    # reversible-kinetics basin AND makes the post-fit ODE stiff.
+    base = [
+        [1e-6, 1e-3, 1e-11, 1e-6 ],
+        [1e-3, 1e-1, 1e-11, 1e-1 ],
+        [1e-2, 1.0,  1e-11, 1.0  ],
+        [1e-5, 1.0,  1e-11, 10.0 ],
     ]
+    rng = np.random.default_rng(42)  # deterministic across requests
+    for _ in range(10):
+        g = (10 ** rng.uniform(-4, 1.5, size=4)).tolist()
+        g[2] = 1e-11
+        base.append(g)
+    return base
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -345,11 +355,14 @@ def kinetics_fit():
 
             for p0 in guesses:
                 try:
+                    # Bounds & tolerances match the reference Tellurium script
+                    # that produced the published curves. k2 ≤ 1e-10 keeps the
+                    # optimiser on the (physical) irreversible-LIDA manifold.
                     res = least_squares(
                         _residuals, p0,
                         args=(t_data, y_data, initial_R, A0, B0),
-                        bounds=([0.0]*4, [100.0, 100.0, 0.1, 100.0]),
-                        ftol=1e-6, xtol=1e-6, max_nfev=60,
+                        bounds=([0.0]*4, [100.0, 100.0, 1e-10, 100.0]),
+                        ftol=1e-8, xtol=1e-8, max_nfev=200,
                     )
                     if res.success and res.cost < best_cost:
                         best_cost, best_res = res.cost, res
@@ -367,10 +380,10 @@ def kinetics_fit():
 
             ku, k1, k2, kr = best_res.x
 
-            # Integrate only over the data window. Extrapolating past
-            # t_data[-1] with unconstrained autocatalytic parameters is the
-            # main reason the dense sim failed for borderline-stiff fits.
-            sim_t, sim_R = _simulate_R_dense(best_res.x, initial_R, float(t_data[-1]), A0, B0)
+            # Small buffer past the last data point for visual continuity in
+            # the kinetic-curves plot. With k2 pinned to ~0 the system is no
+            # longer stiff so this is safe again.
+            sim_t, sim_R = _simulate_R_dense(best_res.x, initial_R, float(t_data[-1]) + 5.0, A0, B0)
 
             curve_note = None
             if sim_t is None:
