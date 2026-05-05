@@ -102,28 +102,30 @@ def _simulate_R_at(params, initial_R, t_eval, A0, B0, rtol=1e-4, atol=1e-7):
 
 def _simulate_R_dense(params, initial_R, t_max, A0, B0, n=100):
     """
-    Dense post-fit simulation for plotting. Tries progressively looser tolerances
-    and a fallback solver before giving up. Tight tolerances (1e-6/1e-9) used to
-    silently fail on borderline-stiff parameter combinations even though the fit
-    itself converged at 1e-4/1e-7 — that left ku/k1/k2/kr populated but simT/simY
-    empty, so the curve never rendered in the UI.
+    Dense post-fit simulation for plotting. Tries progressively gentler
+    integration settings before giving up. Borderline-stiff parameter sets
+    (common when k2 hits its 0.1 bound on high-conversion data) can fail
+    at the original tolerance / grid; smaller t_max + coarser n + RK45 work
+    as last resorts. Each rung sacrifices smoothness, never correctness.
     """
     ku, k1, k2, kr = params
     y0 = [A0, A0, B0, B0, 0.0, 0.0, float(initial_R)]
-    t_grid = np.linspace(0.0, t_max, n)
 
-    # (method, rtol, atol) — start with the same tolerance as the fit, fall back
-    # to looser settings, then a non-stiff solver as a last resort.
     attempts = [
-        ('LSODA', 1e-4, 1e-7),
-        ('LSODA', 1e-3, 1e-6),
-        ('LSODA', 1e-2, 1e-5),
-        ('RK45',  1e-3, 1e-6),
+        (t_max,        n,  'LSODA', 1e-4, 1e-7),
+        (t_max,        n,  'LSODA', 1e-3, 1e-6),
+        (t_max,        n,  'LSODA', 1e-2, 1e-5),
+        (t_max,        n,  'RK45',  1e-3, 1e-6),
+        (t_max * 0.95, 60, 'RK45',  1e-3, 1e-5),
+        (t_max * 0.85, 40, 'RK45',  1e-2, 1e-4),
     ]
-    for method, rtol, atol in attempts:
+    for tmax, npts, method, rtol, atol in attempts:
+        if tmax <= 0:
+            continue
+        t_grid = np.linspace(0.0, tmax, npts)
         try:
             sol = solve_ivp(
-                _replication_ode, (0.0, t_max), y0,
+                _replication_ode, (0.0, tmax), y0,
                 args=(ku, k1, k2, kr),
                 t_eval=t_grid, method=method,
                 rtol=rtol, atol=atol,
