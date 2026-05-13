@@ -76,6 +76,8 @@ def suggest_experiments():
     strategy = config.get('strategy', 'safe')
     min_dist_factor = safe_float(config.get('minDistanceFactor'), 0.05)
 
+    enable_d = bool(config.get('enableCompD', False))
+
     anion_min, cation_min, salt_min = safe_float(config.get('anionMin'), 0.0), safe_float(config.get('cationMin'), 0.0), safe_float(config.get('saltMin'), 0.0)
     anion_max, cation_max, salt_max = safe_float(config.get('anionMax'), 6.0), safe_float(config.get('cationMax'), 6.0), safe_float(config.get('saltMax'), 200.0)
 
@@ -92,8 +94,20 @@ def suggest_experiments():
     cation_step = max(cation_step, (cation_max - cation_min) / MAX_PER_AXIS)
     salt_step   = max(salt_step,   (salt_max   - salt_min)   / MAX_PER_AXIS)
 
-    X_space_min = np.array([anion_min, cation_min, salt_min])
-    X_space_max = np.array([anion_max, cation_max, salt_max])
+    if enable_d:
+        d_min  = safe_float(config.get('compDMin'),  0.0)
+        d_max  = safe_float(config.get('compDMax'),  1.0)
+        d_step = safe_float(config.get('compDStep'), 0.1)
+        if d_step <= 0: d_step = (d_max - d_min) / 20.0 or 1.0
+        # 4D grids explode quickly — cap D axis to 30 steps so 100×100×100×30 is avoided.
+        MAX_D_AXIS = 30
+        d_step = max(d_step, (d_max - d_min) / MAX_D_AXIS)
+        X_space_min = np.array([anion_min, cation_min, salt_min, d_min])
+        X_space_max = np.array([anion_max, cation_max, salt_max, d_max])
+    else:
+        X_space_min = np.array([anion_min, cation_min, salt_min])
+        X_space_max = np.array([anion_max, cation_max, salt_max])
+
     denom = X_space_max - X_space_min
     denom[denom == 0] = 1.0
 
@@ -102,22 +116,36 @@ def suggest_experiments():
     anion_grid = np.arange(anion_min, anion_max + (anion_step*0.1), anion_step)
     cation_grid = np.arange(cation_min, cation_max + (cation_step*0.1), cation_step)
     salt_grid = np.arange(salt_min, salt_max + (salt_step*0.1), salt_step)
-    mesh = np.meshgrid(anion_grid, cation_grid, salt_grid, indexing="ij")
-    points = np.column_stack([m.ravel() for m in mesh])
 
-    df = pd.DataFrame(points, columns=["anion", "cation", "salt"])
+    if enable_d:
+        d_grid = np.arange(d_min, d_max + (d_step*0.1), d_step)
+        mesh = np.meshgrid(anion_grid, cation_grid, salt_grid, d_grid, indexing="ij")
+        points = np.column_stack([m.ravel() for m in mesh])
+        df = pd.DataFrame(points, columns=["anion", "cation", "salt", "compD"])
+    else:
+        mesh = np.meshgrid(anion_grid, cation_grid, salt_grid, indexing="ij")
+        points = np.column_stack([m.ravel() for m in mesh])
+        df = pd.DataFrame(points, columns=["anion", "cation", "salt"])
+
     df["phase"] = -1
+
+    feature_cols = ["anion", "cation", "salt", "compD"] if enable_d else ["anion", "cation", "salt"]
+    dedup_cols = feature_cols
 
     if experiments:
         exp_df = pd.DataFrame(experiments)
-        exp_df = exp_df[["anion", "cation", "salt", "phase"]].apply(pd.to_numeric, errors='coerce').dropna()
+        # Ensure compD column exists when running in 4D (default to 0 if missing).
+        if enable_d and 'compD' not in exp_df.columns:
+            exp_df['compD'] = 0.0
+        cols_needed = feature_cols + ["phase"]
+        exp_df = exp_df[cols_needed].apply(pd.to_numeric, errors='coerce').dropna()
         exp_df = exp_df[exp_df['phase'] != -1]
 
         if not exp_df.empty:
             df = pd.concat([exp_df, df], ignore_index=True)
-            df = df.drop_duplicates(subset=["anion", "cation", "salt"], keep="first")
+            df = df.drop_duplicates(subset=dedup_cols, keep="first")
 
-    X_raw = df[["anion", "cation", "salt"]].values
+    X_raw = df[feature_cols].values
     X = (X_raw - X_space_min) / denom
     y = df["phase"].values.astype(int)
     known_mask = y != -1
@@ -184,13 +212,16 @@ def suggest_experiments():
     suggestions = []
     current_id = start_id
     for idx, row in suggested_df.iterrows():
-        suggestions.append({
+        sug = {
             "sampleId": current_id,
             "anion": round(row['anion'], 2),
             "cation": round(row['cation'], 2),
             "salt": round(row['salt'], 1),
             "phase": -1
-        })
+        }
+        if enable_d:
+            sug["compD"] = round(float(row['compD']), 3)
+        suggestions.append(sug)
         current_id += 1
 
     return jsonify({"suggestions": suggestions})
@@ -203,27 +234,40 @@ def phase_boundary():
 
     if not experiments: return jsonify({"error": "No data."}), 400
 
+    enable_d = bool(config.get('enableCompD', False))
+
     n_received = len(experiments)
     exp_df = pd.DataFrame(experiments)
-    exp_df = exp_df[["anion", "cation", "salt", "phase"]].apply(pd.to_numeric, errors='coerce').dropna()
+    if enable_d and 'compD' not in exp_df.columns:
+        exp_df['compD'] = 0.0
+    cols_needed = ["anion", "cation", "salt", "compD", "phase"] if enable_d else ["anion", "cation", "salt", "phase"]
+    exp_df = exp_df[cols_needed].apply(pd.to_numeric, errors='coerce').dropna()
     # Keep only labeled rows; prefer the last entry for duplicate coordinates (covers phase updates)
     exp_df = exp_df[exp_df['phase'] != -1]
-    exp_df = exp_df.drop_duplicates(subset=["anion", "cation", "salt"], keep="last")
+    feature_cols = ["anion", "cation", "salt", "compD"] if enable_d else ["anion", "cation", "salt"]
+    exp_df = exp_df.drop_duplicates(subset=feature_cols, keep="last")
 
     n_labeled = len(exp_df)
-    print(f"[phase-boundary] received={n_received}  labeled={n_labeled}  phases={sorted(exp_df['phase'].unique().tolist())}")
+    print(f"[phase-boundary] received={n_received}  labeled={n_labeled}  4D={enable_d}  phases={sorted(exp_df['phase'].unique().tolist())}")
 
     if n_labeled < 2 or len(np.unique(exp_df['phase'])) < 2:
         return jsonify({"error": f"Need at least 2 labeled points from 2 different phases (got {n_labeled} labeled)."}), 400
 
-    X_known = exp_df[["anion", "cation", "salt"]].values
+    X_known = exp_df[feature_cols].values
     y_known = exp_df["phase"].values.astype(int)
 
     anion_min, cation_min, salt_min = safe_float(config.get('anionMin'), 0.0), safe_float(config.get('cationMin'), 0.0), safe_float(config.get('saltMin'), 0.0)
     anion_max, cation_max, salt_max = safe_float(config.get('anionMax'), 6.0), safe_float(config.get('cationMax'), 6.0), safe_float(config.get('saltMax'), 200.0)
 
-    X_space_min = np.array([anion_min, cation_min, salt_min])
-    X_space_max = np.array([anion_max, cation_max, salt_max])
+    if enable_d:
+        d_min = safe_float(config.get('compDMin'), 0.0)
+        d_max = safe_float(config.get('compDMax'), 1.0)
+        X_space_min = np.array([anion_min, cation_min, salt_min, d_min])
+        X_space_max = np.array([anion_max, cation_max, salt_max, d_max])
+    else:
+        X_space_min = np.array([anion_min, cation_min, salt_min])
+        X_space_max = np.array([anion_max, cation_max, salt_max])
+
     denom = X_space_max - X_space_min
     denom[denom == 0] = 1.0
 
@@ -232,11 +276,39 @@ def phase_boundary():
     clf = RandomForestClassifier(n_estimators=300, random_state=RANDOM_STATE)
     clf.fit(X_known_scaled, y_known)
 
-    # 20^3 grid for the probability field
+    # 20^3 grid for the probability field (3D mode).
+    # In 4D mode, slice the D axis at N_D values and stack 20^3 grids for each — the
+    # frontend renders the slice closest to the current D slider value.
     N = 20
     anion_grid = np.linspace(anion_min, anion_max, N)
     cation_grid = np.linspace(cation_min, cation_max, N)
     salt_grid = np.linspace(salt_min, salt_max, N)
+
+    if enable_d:
+        N_D = 8  # number of D slices the frontend can interpolate between
+        d_grid = np.linspace(d_min, d_max, N_D)
+        mesh = np.meshgrid(anion_grid, cation_grid, salt_grid, d_grid, indexing="ij")
+        grid_points = np.column_stack([m.ravel() for m in mesh])
+        grid_scaled = (grid_points - X_space_min) / denom
+        predicted_class = clf.predict(grid_scaled)
+        prob_dict = {}
+        for class_label in clf.classes_:
+            field = (predicted_class == class_label).astype(float).reshape(N, N, N, N_D)
+            # Smooth only the 3 spatial axes; keep D crisp.
+            smoothed = gaussian_filter(field, sigma=(1.0, 1.0, 1.0, 0.0))
+            prob_dict[str(class_label)] = smoothed.ravel().tolist()
+        return jsonify({
+            "x": grid_points[:, 0].tolist(),
+            "y": grid_points[:, 1].tolist(),
+            "z": grid_points[:, 2].tolist(),
+            "d": grid_points[:, 3].tolist(),
+            "probs": prob_dict,
+            "n_received": n_received,
+            "n_labeled": n_labeled,
+            "phases_used": sorted([int(c) for c in clf.classes_]),
+            "enable_d": True
+        })
+
     mesh = np.meshgrid(anion_grid, cation_grid, salt_grid, indexing="ij")
     grid_points = np.column_stack([m.ravel() for m in mesh])
     grid_scaled = (grid_points - X_space_min) / denom
