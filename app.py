@@ -102,6 +102,16 @@ def snap_to_axis(values, lo, step):
     if step <= 0: return values
     return lo + np.round((values - lo) / step) * step
 
+class LinkInfeasible(Exception):
+    """A component link that no well in the configured ranges can satisfy."""
+    pass
+
+def comp_label(config, key):
+    return config.get(key + 'Name') or {"anion": "A", "cation": "B", "salt": "C", "compD": "D"}[key]
+
+def comp_unit(config, key):
+    return config.get(key + 'Unit') or ''
+
 def apply_dependencies(df, config, feature_cols):
     """Restrict the candidate grid to combinations the component links allow.
 
@@ -130,6 +140,10 @@ def apply_dependencies(df, config, feature_cols):
         before = len(df)
         s = df[src].to_numpy()
 
+        src_name, tgt_name = comp_label(config, src), comp_label(config, tgt)
+        unit = comp_unit(config, tgt)
+        arrow = f"link {src_name} → {tgt_name}"
+
         if dep.get('mode') == 'range':
             f_max = safe_float(dep.get('factorMax'), factor)
             o_max = safe_float(dep.get('offsetMax'), offset)
@@ -137,11 +151,23 @@ def apply_dependencies(df, config, feature_cols):
             band_lo, band_hi = np.minimum(a, b), np.maximum(a, b)
             t = df[tgt].to_numpy()
             df = df.loc[(t >= band_lo - EPS) & (t <= band_hi + EPS)]
+            if df.empty:
+                raise LinkInfeasible(
+                    f"{arrow} (between {factor:g}× and {f_max:g}× {src_name}) asks for {tgt_name} "
+                    f"somewhere in {band_lo.min():g}–{band_hi.max():g} {unit}, but {tgt_name} is set to "
+                    f"{t_lo:g}–{t_hi:g} {unit} in steps of {t_step:g} and no step lands in the band. "
+                    f"Widen {tgt_name}'s range, use a finer step, or change the link's multipliers.")
         else:
             derived = s * factor + offset
             if dep.get('snapStep'):
                 derived = snap_to_axis(derived, t_lo, t_step)
             keep = (derived >= t_lo - EPS) & (derived <= t_hi + EPS)
+            if not keep.any():
+                raise LinkInfeasible(
+                    f"{arrow} (= {factor:g} × {src_name}{f' + {offset:g}' if offset else ''}) needs "
+                    f"{tgt_name} between {derived.min():g} and {derived.max():g} {unit}, but {tgt_name} "
+                    f"is set to {t_lo:g}–{t_hi:g} {unit}. Widen {tgt_name}'s range, narrow {src_name}'s, "
+                    f"change the factor, or reverse the link so {src_name} is derived from {tgt_name}.")
             df = df.loc[keep].copy()
             df[tgt] = np.round(derived[keep], 6)
 
@@ -243,7 +269,10 @@ def suggest_experiments():
     df = pd.DataFrame(points, columns=feature_cols)
 
     n_full_grid = len(df)
-    df, dep_notes = apply_dependencies(df, config, feature_cols)
+    try:
+        df, dep_notes = apply_dependencies(df, config, feature_cols)
+    except LinkInfeasible as e:
+        return jsonify({"error": str(e)}), 400
     if df.empty:
         return jsonify({"error": "No well satisfies the configured component links inside the given "
                                  "ranges. Loosen a link's factor/offset or widen the linked "
