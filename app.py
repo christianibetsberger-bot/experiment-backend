@@ -106,6 +106,49 @@ class LinkInfeasible(Exception):
     """A component link that no well in the configured ranges can satisfy."""
     pass
 
+class VolumeInfeasible(Exception):
+    """No well in the configured ranges fits inside the target well volume."""
+    pass
+
+# Mirrors getMM() in PhasePredictor.vue — used only for ratios, where the scale cancels.
+_UNIT_MM = {'M': 1000.0, 'mM': 1.0, 'µM': 1e-3, 'nM': 1e-6,
+            'mg/mL': 1.0, 'µg/µL': 1.0, 'ng/µL': 1e-3, 'X': 1.0, '%': 10.0}
+
+def to_mM(val, unit):
+    v = safe_float(val, 0.0)
+    if not v: return 0.0
+    return v * _UNIT_MM.get(unit, 1.0)
+
+def constants_volume_fraction(config):
+    """Share of every well already taken by the constant components (same in all wells)."""
+    total = 0.0
+    for k in (config.get('constants') or []):
+        if not isinstance(k, dict): continue
+        stock_mM = to_mM(k.get('stockConc'), k.get('stockUnit'))
+        conc_mM = to_mM(k.get('conc'), k.get('unit'))
+        if stock_mM > 0:
+            total += conc_mM / stock_mM
+    return total
+
+def volume_fraction(df, config, feature_cols):
+    """Fraction of the well each candidate needs: Σ(target / stock) + constants.
+
+    Every component is a plain dilution — v = c_target·V / c_stock — so the well
+    volume cancels and feasibility is scale-free: the sum of the ratios must be ≤ 1.
+    A component with no stock concentration contributes nothing, matching
+    computeWellVolumes(), which pipettes 0 µL for it.
+    Target and stock always share a unit (changeUnit/selectInventory move them together),
+    so the ratio needs no conversion; the constants carry their own units, hence to_mM.
+    """
+    stock_key = {'anion': 'stockAnion', 'cation': 'stockCation',
+                 'salt': 'stockSalt', 'compD': 'stockCompD'}
+    frac = np.full(len(df), constants_volume_fraction(config), dtype=float)
+    for k in feature_cols:
+        stock = safe_float(config.get(stock_key[k]), 0.0)
+        if stock > 0:
+            frac = frac + df[k].to_numpy(dtype=float) / stock
+    return frac
+
 def comp_label(config, key):
     return config.get(key + 'Name') or {"anion": "A", "cation": "B", "salt": "C", "compD": "D"}[key]
 
@@ -273,11 +316,39 @@ def suggest_experiments():
         df, dep_notes = apply_dependencies(df, config, feature_cols)
     except LinkInfeasible as e:
         return jsonify({"error": str(e)}), 400
+    except VolumeInfeasible as e:
+        return jsonify({"error": str(e)}), 400
     if df.empty:
         return jsonify({"error": "No well satisfies the configured component links inside the given "
                                  "ranges. Loosen a link's factor/offset or widen the linked "
                                  "component's min/max."}), 400
+    # Volume feasibility — applied to the candidate grid, not checked afterwards.
+    # A well whose components add up to more than the tube holds cannot be mixed at
+    # the stated concentrations, so it is not an experiment the engine may propose:
+    # it is removed from the search space and the engine spends that well elsewhere.
+    n_before_vol = len(df)
+    vol_frac = volume_fraction(df, config, feature_cols)
+    df = df.loc[vol_frac <= 1.0 + EPS].reset_index(drop=True)
+    n_dropped_vol = n_before_vol - len(df)
+    if df.empty:
+        target_v = safe_float(config.get('targetVolume'), 0.0)
+        lightest = float(np.min(vol_frac)) if n_before_vol else 0.0
+        need = (' The lightest combination in these ranges needs %.1f µL.' % (lightest * target_v)) if target_v > 0 else ''
+        return jsonify({'error':
+            'No well in these ranges fits in the %s µL target volume — every combination '
+            'needs more stock than the well holds.%s Use more concentrated stocks, lower the '
+            'component maxima, or raise the target well volume.'
+            % (('%g' % target_v) if target_v > 0 else '?', need)}), 400
+
     n_candidates = len(df)
+    if n_dropped_vol:
+        warnings.append({
+            'axis': 'volume',
+            'message': '%s of %s wells cannot be mixed in %g µL and were excluded — the engine '
+                       'only proposes compositions that physically fit'
+                       % ('{:,}'.format(n_dropped_vol), '{:,}'.format(n_before_vol),
+                          safe_float(config.get('targetVolume'), 0.0)),
+        })
     if dep_notes:
         warnings.append({
             "axis": "links",

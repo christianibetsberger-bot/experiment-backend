@@ -105,6 +105,34 @@ def audit_unique(label, c, sugs):
     check(f"{label}: no duplicate wells", len(wells) == len(sugs),
           f"{len(sugs)} returned but only {len(wells)} distinct")
 
+def volume_fraction(w, c):
+    """Share of the well this composition needs — mirrors computeWellVolumes in the app.
+    Every component is a plain dilution, so the well volume cancels and the test is
+    simply that the ratios sum to <= 1."""
+    um = {'M': 1000, 'mM': 1, 'µM': 1e-3, 'nM': 1e-6, 'mg/mL': 1, 'µg/µL': 1, 'ng/µL': 1e-3, 'X': 1, '%': 10}
+    f = 0.0
+    for key, stock in (('anion', 'stockAnion'), ('cation', 'stockCation'), ('salt', 'stockSalt')):
+        if c.get(stock, 0) > 0:
+            f += w[key] / c[stock]
+    if c.get('enableCompD') and c.get('stockCompD', 0) > 0:
+        f += w.get('compD', 0) / c['stockCompD']
+    for k in c.get('constants', []):
+        sm = k['stockConc'] * um.get(k['stockUnit'], 1)
+        cm = k['conc'] * um.get(k['unit'], 1)
+        if sm > 0:
+            f += cm / sm
+    return f
+
+
+def audit_volume(label, c, sugs):
+    """An overfilled well holds none of the concentrations it claims, so the engine must
+    never propose one — the constraint belongs in the search space, not in a warning."""
+    V = c.get('targetVolume', 0)
+    over = [(w, volume_fraction(w, c) * V) for w in sugs if volume_fraction(w, c) > 1 + 1e-9]
+    check(f"{label}: every well fits in {V} uL", not over,
+          (f"{len(over)} overfilled, e.g. {over[0][0]} needs {over[0][1]:.1f} uL") if over else "")
+
+
 def run(label, c, n=16, expect_status=200):
     code, data = suggest(c, n)
     check(f"{label}: HTTP {expect_status}", code == expect_status, f"got {code} {data.get('error', '')}")
@@ -114,6 +142,7 @@ def run(label, c, n=16, expect_status=200):
     audit_bounds_and_grid(label, c, sugs)
     audit_links(label, c, sugs)
     audit_unique(label, c, sugs)
+    audit_volume(label, c, sugs)
     return data
 
 
@@ -161,6 +190,25 @@ run("risky", cfg(strategy="risky",
 
 print("\n[11] collapsed axis (min == max)")
 run("collapsed", cfg(saltMin=50, saltMax=50, saltStep=10))
+
+print("\n[12] volume: dilute stocks must not produce overfilled wells")
+run("dilute stocks", cfg(stockAnion=60, stockSalt=12, targetVolume=50))
+
+print("\n[13] volume: a constant taking 40% of every well")
+run("big constant", cfg(targetVolume=50,
+                        constants=[dict(id='k1', name='EDC', conc=40, unit='mM', stockConc=100, stockUnit='mM')]))
+
+print("\n[14] volume: 4 components plus a constant")
+run("4 comp + constant", cfg(enableCompD=True, stockCompD=50, targetVolume=50,
+                            constants=[dict(id='k1', name='EDC', conc=20, unit='mM', stockConc=100, stockUnit='mM')]))
+
+print("\n[15] volume: a search space where nothing can be mixed -> a clear 400")
+# Minima alone overflow: A needs >= 5/6 of the well and B >= 5/6, so no combination fits.
+# (Ranges that include 0 always have the trivially-mixable empty well, hence the minima.)
+data = run("unmixable", cfg(anionMin=5, anionMax=6, stockAnion=6,
+                            cationMin=5, cationMax=6, stockCation=6,
+                            saltMin=0, saltMax=10, stockSalt=100, targetVolume=50), expect_status=400)
+check("unmixable: explains itself", bool(data.get("error")), "no error message returned")
 
 print("\n" + ("FAILED: " + "; ".join(FAILURES) if FAILURES else "All checks passed."))
 sys.exit(1 if FAILURES else 0)
